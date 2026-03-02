@@ -53,7 +53,7 @@ import (
 // ---------------------------------------------------------------------------
 
 const (
-	version           = "0.2.0"
+	version           = "0.2.1"
 	defaultDB         = "index.sqlite"
 	chunkTarget       = 900  // target tokens per chunk
 	chunkLookback     = 200  // tokens to look back for break points
@@ -61,6 +61,10 @@ const (
 	rrfK              = 60   // RRF fusion constant
 	maxRerank         = 30   // candidates sent to reranker
 	maxIndexFileBytes = 1 << 20 // 1 MB file size limit for indexing
+
+	// BM25 tuning: target parameters (FTS5 hardcodes k1=1.2, b=0.75)
+	bm25TargetB  = 0.55 // lower b → less penalty on long docs (default FTS5: 0.75)
+	bm25DefaultB = 0.75 // FTS5 built-in value
 )
 
 // skipDirs are directories that should never be traversed during indexing.
@@ -210,7 +214,7 @@ func (s *Store) migrate() error {
 	}
 	defer s.pool.Put(conn)
 
-	return sqlitex.ExecuteScript(conn, `
+	err = sqlitex.ExecuteScript(conn, `
 		CREATE TABLE IF NOT EXISTS collections (
 			id      INTEGER PRIMARY KEY,
 			name    TEXT UNIQUE NOT NULL,
@@ -257,6 +261,15 @@ func (s *Store) migrate() error {
 		CREATE INDEX IF NOT EXISTS idx_doc_docid ON documents(docid);
 		CREATE INDEX IF NOT EXISTS idx_vec_hash ON content_vectors(hash);
 	`, nil)
+	if err != nil {
+		return err
+	}
+
+	// Migration: add doc_len column for BM25 length normalization
+	// ALTER TABLE fails silently if column already exists — that's fine
+	sqlitex.Execute(conn, `ALTER TABLE documents ADD COLUMN doc_len INTEGER NOT NULL DEFAULT 0`, nil)
+
+	return nil
 }
 
 // UpsertCollection adds or updates a collection and returns its ID.
@@ -318,12 +331,13 @@ func (s *Store) UpsertDocument(colID int64, relPath, title, content string) erro
 		return nil // unchanged
 	}
 
-	// Upsert document row
+	// Upsert document row (doc_len = rune count / 4 ≈ token count)
+	docLen := utf8.RuneCountInString(content) / 4
 	err = sqlitex.Execute(conn,
-		`INSERT INTO documents (col_id, path, title, docid, hash, active)
-		 VALUES (?, ?, ?, ?, ?, 1)
-		 ON CONFLICT(col_id, path) DO UPDATE SET title=excluded.title, docid=excluded.docid, hash=excluded.hash, active=1`,
-		&sqlitex.ExecOptions{Args: []any{colID, relPath, title, docid, hash}})
+		`INSERT INTO documents (col_id, path, title, docid, hash, active, doc_len)
+		 VALUES (?, ?, ?, ?, ?, 1, ?)
+		 ON CONFLICT(col_id, path) DO UPDATE SET title=excluded.title, docid=excluded.docid, hash=excluded.hash, active=1, doc_len=excluded.doc_len`,
+		&sqlitex.ExecOptions{Args: []any{colID, relPath, title, docid, hash, docLen}})
 	if err != nil {
 		return err
 	}
@@ -394,53 +408,230 @@ func (s *Store) DeactivateStale(colID int64, activePaths map[string]bool) error 
 	return nil
 }
 
-// SearchBM25 performs FTS5 BM25 ranked search.
+// SearchBM25 performs FTS5 BM25 ranked search with column weights and b-correction.
 func (s *Store) SearchBM25(query string, limit int) ([]SearchResult, error) {
+	return s.searchBM25(query, "", limit)
+}
+
+// SearchBM25InCollection performs BM25 search scoped to a single collection.
+func (s *Store) SearchBM25InCollection(query, collection string, limit int) ([]SearchResult, error) {
+	return s.searchBM25(query, collection, limit)
+}
+
+func (s *Store) searchBM25(query, collection string, limit int) ([]SearchResult, error) {
 	conn, err := s.pool.Take(context.Background())
 	if err != nil {
 		return nil, err
 	}
 	defer s.pool.Put(conn)
 
-	ftsQuery := toFTS5Query(query)
-	var results []SearchResult
+	// Compute average doc_len for b-correction
+	var avgDocLen float64
+	err = sqlitex.Execute(conn, `SELECT AVG(doc_len) FROM documents WHERE active=1 AND doc_len>0`,
+		&sqlitex.ExecOptions{
+			ResultFunc: func(stmt *sqlite.Stmt) error {
+				avgDocLen = stmt.ColumnFloat(0)
+				return nil
+			},
+		})
+	if err != nil || avgDocLen == 0 {
+		avgDocLen = 500 // reasonable fallback
+	}
 
-	err = sqlitex.Execute(conn, `
+	ftsQuery := toFTS5Query(query)
+
+	// Column weights: title=5.0, content=1.0, docid=0.0
+	sql := `
 		SELECT d.docid, d.path, d.title,
-		       -rank AS score,
+		       bm25(documents_fts, 5.0, 1.0, 0.0) AS score,
 		       snippet(documents_fts, 1, '>>>', '<<<', '...', 40) AS snip,
-		       c.context
+		       c.context, d.doc_len, c.name AS col_name
 		FROM documents_fts f
 		JOIN documents d ON d.id = f.rowid
 		JOIN collections c ON c.id = d.col_id
 		WHERE documents_fts MATCH ?
-		  AND d.active = 1
-		ORDER BY rank
-		LIMIT ?
-	`, &sqlitex.ExecOptions{
-		Args: []any{ftsQuery, limit},
+		  AND d.active = 1`
+	args := []any{ftsQuery}
+
+	if collection != "" {
+		sql += ` AND c.name = ?`
+		args = append(args, collection)
+	}
+
+	sql += `
+		ORDER BY score
+		LIMIT ?`
+	args = append(args, limit)
+
+	type rawResult struct {
+		result SearchResult
+		docLen float64
+	}
+	var raw []rawResult
+
+	err = sqlitex.Execute(conn, sql, &sqlitex.ExecOptions{
+		Args: args,
 		ResultFunc: func(stmt *sqlite.Stmt) error {
-			results = append(results, SearchResult{
-				DocID:   stmt.ColumnText(0),
-				Path:    stmt.ColumnText(1),
-				Title:   stmt.ColumnText(2),
-				Score:   stmt.ColumnFloat(3),
-				Snippet: stmt.ColumnText(4),
-				Context: stmt.ColumnText(5),
+			raw = append(raw, rawResult{
+				result: SearchResult{
+					DocID:   stmt.ColumnText(0),
+					Path:    stmt.ColumnText(1),
+					Title:   stmt.ColumnText(2),
+					Score:   -stmt.ColumnFloat(3), // bm25() returns negative scores
+					Snippet: stmt.ColumnText(4),
+					Context: stmt.ColumnText(5),
+				},
+				docLen: stmt.ColumnFloat(6),
 			})
 			return nil
 		},
 	})
-	return results, err
+	if err != nil {
+		return nil, err
+	}
+
+	// Apply post-FTS5 b-correction: adjust from default b=0.75 to target b=0.55
+	results := make([]SearchResult, len(raw))
+	for i, r := range raw {
+		results[i] = r.result
+		if r.docLen > 0 {
+			results[i].Score *= adjustBM25B(r.docLen, avgDocLen)
+		}
+	}
+
+	// Re-sort after correction (order may shift slightly)
+	sort.Slice(results, func(i, j int) bool { return results[i].Score > results[j].Score })
+
+	return results, nil
 }
 
-// SearchVector performs optimized cosine similarity search over stored embeddings.
-func (s *Store) SearchVector(queryVec []float32, limit int) ([]SearchResult, error) {
+// adjustBM25B compensates for FTS5's hardcoded b=0.75, shifting toward target b.
+// correction = (1 - targetB + targetB*docLen/avgDocLen) / (1 - defaultB + defaultB*docLen/avgDocLen)
+func adjustBM25B(docLen, avgDocLen float64) float64 {
+	ratio := docLen / avgDocLen
+	return (1 - bm25TargetB + bm25TargetB*ratio) / (1 - bm25DefaultB + bm25DefaultB*ratio)
+}
+
+// ActiveCollectionNames returns distinct collection names that have active documents.
+func (s *Store) ActiveCollectionNames() ([]string, error) {
 	conn, err := s.pool.Take(context.Background())
 	if err != nil {
 		return nil, err
 	}
 	defer s.pool.Put(conn)
+
+	var names []string
+	err = sqlitex.Execute(conn, `
+		SELECT DISTINCT c.name FROM collections c
+		JOIN documents d ON d.col_id = c.id
+		WHERE d.active = 1`,
+		&sqlitex.ExecOptions{
+			ResultFunc: func(stmt *sqlite.Stmt) error {
+				names = append(names, stmt.ColumnText(0))
+				return nil
+			},
+		})
+	return names, err
+}
+
+// SearchBM25Normalized runs BM25 per-collection and fuses via RRF so small
+// collections get fair representation against large ones.
+func (s *Store) SearchBM25Normalized(query string, limit int) ([]SearchResult, error) {
+	names, err := s.ActiveCollectionNames()
+	if err != nil || len(names) <= 1 {
+		// Single collection or error — fall back to normal search
+		return s.SearchBM25(query, limit)
+	}
+
+	// Run per-collection searches
+	type rankedList struct {
+		results []SearchResult
+	}
+	var lists []rankedList
+	for _, name := range names {
+		results, err := s.SearchBM25InCollection(query, name, limit)
+		if err != nil {
+			continue
+		}
+		if len(results) > 0 {
+			lists = append(lists, rankedList{results: results})
+		}
+	}
+
+	if len(lists) == 0 {
+		return nil, nil
+	}
+
+	// Per-collection RRF fusion: each collection is a separate ranked list
+	scores := make(map[string]float64)
+	docs := make(map[string]SearchResult)
+	for _, list := range lists {
+		for rank, r := range list.results {
+			scores[r.DocID] += 1.0 / float64(rrfK+rank+1)
+			if _, ok := docs[r.DocID]; !ok {
+				docs[r.DocID] = r
+			}
+		}
+	}
+
+	type entry struct {
+		docID string
+		score float64
+	}
+	var entries []entry
+	for id, sc := range scores {
+		entries = append(entries, entry{id, sc})
+	}
+	sort.Slice(entries, func(i, j int) bool { return entries[i].score > entries[j].score })
+
+	var results []SearchResult
+	for _, e := range entries {
+		r := docs[e.docID]
+		r.Score = e.score
+		results = append(results, r)
+		if len(results) >= limit {
+			break
+		}
+	}
+	return results, nil
+}
+
+// SearchVector performs optimized cosine similarity search over stored embeddings.
+func (s *Store) SearchVector(queryVec []float32, limit int) ([]SearchResult, error) {
+	return s.searchVector(queryVec, "", limit)
+}
+
+// SearchVectorInCollection performs vector search scoped to a single collection.
+func (s *Store) SearchVectorInCollection(queryVec []float32, collection string, limit int) ([]SearchResult, error) {
+	return s.searchVector(queryVec, collection, limit)
+}
+
+func (s *Store) searchVector(queryVec []float32, collection string, limit int) ([]SearchResult, error) {
+	conn, err := s.pool.Take(context.Background())
+	if err != nil {
+		return nil, err
+	}
+	defer s.pool.Put(conn)
+
+	// Build set of hashes belonging to the collection (if filtered)
+	var collectionHashes map[string]bool
+	if collection != "" {
+		collectionHashes = make(map[string]bool)
+		err = sqlitex.Execute(conn, `
+			SELECT DISTINCT d.hash FROM documents d
+			JOIN collections c ON c.id = d.col_id
+			WHERE c.name = ? AND d.active = 1`,
+			&sqlitex.ExecOptions{
+				Args: []any{collection},
+				ResultFunc: func(stmt *sqlite.Stmt) error {
+					collectionHashes[stmt.ColumnText(0)] = true
+					return nil
+				},
+			})
+		if err != nil {
+			return nil, err
+		}
+	}
 
 	bestByHash := make(map[string]float64)
 
@@ -463,6 +654,12 @@ func (s *Store) SearchVector(queryVec []float32, limit int) ([]SearchResult, err
 		&sqlitex.ExecOptions{
 			ResultFunc: func(stmt *sqlite.Stmt) error {
 				h := stmt.ColumnText(0)
+
+				// Skip hashes not in the target collection
+				if collectionHashes != nil && !collectionHashes[h] {
+					return nil
+				}
+
 				vecLen := stmt.ColumnLen(1)
 				if vecLen != vecDim*4 {
 					return nil
@@ -1320,7 +1517,13 @@ func (m *MCPServer) callTool(params json.RawMessage) (any, error) {
 
 	switch call.Name {
 	case "search":
-		results, err := m.store.SearchBM25(args.Query, args.Limit)
+		var results []SearchResult
+		var err error
+		if args.Collection != "" {
+			results, err = m.store.SearchBM25InCollection(args.Query, args.Collection, args.Limit)
+		} else {
+			results, err = m.store.SearchBM25Normalized(args.Query, args.Limit)
+		}
 		if err != nil {
 			return nil, err
 		}
@@ -1333,7 +1536,12 @@ func (m *MCPServer) callTool(params json.RawMessage) (any, error) {
 		if err != nil {
 			return nil, err
 		}
-		results, err := m.store.SearchVector(qvec, args.Limit)
+		var results []SearchResult
+		if args.Collection != "" {
+			results, err = m.store.SearchVectorInCollection(qvec, args.Collection, args.Limit)
+		} else {
+			results, err = m.store.SearchVector(qvec, args.Limit)
+		}
 		if err != nil {
 			return nil, err
 		}
@@ -1346,7 +1554,7 @@ func (m *MCPServer) callTool(params json.RawMessage) (any, error) {
 		return applyMaxChars(toolResult(filtered), args.MaxChars), nil
 
 	case "deep_search":
-		results, err := m.hybrid.Search(context.Background(), args.Query, args.Limit)
+		results, err := m.hybrid.Search(context.Background(), args.Query, args.Collection, args.Limit)
 		if err != nil {
 			return nil, err
 		}
@@ -1356,10 +1564,19 @@ func (m *MCPServer) callTool(params json.RawMessage) (any, error) {
 
 	case "research":
 		// Composite: BM25 + vector search, deduplicated via RRF
-		bm25Results, _ := m.store.SearchBM25(args.Query, args.Limit*2)
+		var bm25Results []SearchResult
+		if args.Collection != "" {
+			bm25Results, _ = m.store.SearchBM25InCollection(args.Query, args.Collection, args.Limit*2)
+		} else {
+			bm25Results, _ = m.store.SearchBM25Normalized(args.Query, args.Limit*2)
+		}
 		var vecResults []SearchResult
 		if qvec, err := m.engine.Embed(args.Query, true); err == nil {
-			vecResults, _ = m.store.SearchVector(qvec, args.Limit*2)
+			if args.Collection != "" {
+				vecResults, _ = m.store.SearchVectorInCollection(qvec, args.Collection, args.Limit*2)
+			} else {
+				vecResults, _ = m.store.SearchVector(qvec, args.Limit*2)
+			}
 		}
 		merged := simpleRRF(bm25Results, vecResults, args.Limit)
 		filtered := filterMinScore(merged, args.MinScore)
@@ -1900,7 +2117,7 @@ func main() {
 		// Full hybrid: all 3 models available
 		if hasEmbed && hasRerank && hasExpand {
 			hybrid := newHybridSearcher(store, engine)
-			results, err := hybrid.Search(context.Background(), query, limit)
+			results, err := hybrid.Search(context.Background(), query, "", limit)
 			if err != nil {
 				return err
 			}
@@ -2195,7 +2412,7 @@ Quick start:
 
 			engine := NewLLMEngine(cacheDir())
 			hybrid := newHybridSearcher(store, engine)
-			results, err := hybrid.Search(context.Background(), query, limit)
+			results, err := hybrid.Search(context.Background(), query, "", limit)
 			if err != nil {
 				return err
 			}

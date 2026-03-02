@@ -185,7 +185,7 @@ picoqmd mcp                           # stdio transport (for Claude Code/Desktop
 picoqmd mcp --http :8181              # HTTP transport
 ```
 
-Exposes 6 tools: `search`, `vector_search`, `deep_search`, `get`, `multi_get`, `status`.
+Exposes 7 tools: `search`, `vector_search`, `deep_search`, `research`, `get`, `multi_get`, `status`.
 
 #### Claude Code Integration
 

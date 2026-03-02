@@ -16,7 +16,23 @@ Most search tools assume beefy hardware. PicoQMD is built for the other end of t
 - **Scales up** — add semantic vector search and hybrid re-ranking when your hardware allows
 - **Graceful degradation** — without models, vector/hybrid/research tools are hidden from the agent; BM25, get, and observations still work
 
-## What's New in v0.2.0
+## What's New in v0.2.1
+
+### Collection-Size Normalization
+
+Unscoped searches now use per-collection Reciprocal Rank Fusion so small collections (4 docs) get fair representation against large ones (800+ docs). Each collection is searched independently and results are interleaved by rank, not raw count. When you pass the `collection` parameter, searches are scoped directly to that collection.
+
+### BM25 Column Weights
+
+Title matches are now boosted 5x over content matches via FTS5 `bm25()` column weights: `title=5.0, content=1.0, docid=0.0`. A document whose title contains your query term now reliably outranks one that merely mentions it in the body.
+
+### Document Length Normalization (b-correction)
+
+FTS5 hardcodes BM25's `b` parameter at 0.75, which over-penalizes long documents. PicoQMD now applies a post-FTS5 correction that shifts `b` to 0.55 — reducing the length penalty so comprehensive source files and detailed docs score fairly against short notes. Document lengths are tracked during indexing (`doc_len` column).
+
+---
+
+### v0.2.0
 
 ### Composite `research` Tool
 

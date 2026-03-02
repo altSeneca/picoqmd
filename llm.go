@@ -495,7 +495,7 @@ func newHybridSearcher(store *Store, engine Embedder) Searcher {
 	return &HybridSearcher{store: store, engine: engine}
 }
 
-func (h *HybridSearcher) Search(ctx context.Context, query string, limit int) ([]SearchResult, error) {
+func (h *HybridSearcher) Search(ctx context.Context, query, collection string, limit int) ([]SearchResult, error) {
 	expansions, err := h.engine.ExpandQuery(query)
 	if err != nil {
 		expansions = nil
@@ -527,7 +527,13 @@ func (h *HybridSearcher) Search(ctx context.Context, query string, limit int) ([
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
-				results, err := h.store.SearchBM25(wq.query, 20)
+				var results []SearchResult
+				var err error
+				if collection != "" {
+					results, err = h.store.SearchBM25InCollection(wq.query, collection, 20)
+				} else {
+					results, err = h.store.SearchBM25Normalized(wq.query, 20)
+				}
 				if err != nil {
 					return
 				}
@@ -544,7 +550,12 @@ func (h *HybridSearcher) Search(ctx context.Context, query string, limit int) ([
 				if err != nil {
 					return
 				}
-				results, err := h.store.SearchVector(qvec, 20)
+				var results []SearchResult
+				if collection != "" {
+					results, err = h.store.SearchVectorInCollection(qvec, collection, 20)
+				} else {
+					results, err = h.store.SearchVector(qvec, 20)
+				}
 				if err != nil {
 					return
 				}

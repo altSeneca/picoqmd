@@ -27,7 +27,7 @@ type Embedder interface {
 
 // Searcher abstracts hybrid/vector search pipelines.
 type Searcher interface {
-	Search(ctx context.Context, query string, limit int) ([]SearchResult, error)
+	Search(ctx context.Context, query, collection string, limit int) ([]SearchResult, error)
 }
 
 // ---------------------------------------------------------------------------

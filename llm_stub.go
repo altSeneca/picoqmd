@@ -64,9 +64,15 @@ func newHybridSearcher(store *Store, engine Embedder) Searcher {
 	return &BM25OnlySearcher{store: store}
 }
 
-func (s *BM25OnlySearcher) Search(ctx context.Context, query string, limit int) ([]SearchResult, error) {
+func (s *BM25OnlySearcher) Search(ctx context.Context, query, collection string, limit int) ([]SearchResult, error) {
 	// 1. BM25 seed
-	bm25Results, err := s.store.SearchBM25(query, 20)
+	var bm25Results []SearchResult
+	var err error
+	if collection != "" {
+		bm25Results, err = s.store.SearchBM25InCollection(query, collection, 20)
+	} else {
+		bm25Results, err = s.store.SearchBM25Normalized(query, 20)
+	}
 	if err != nil {
 		return nil, err
 	}
