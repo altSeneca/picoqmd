@@ -1,6 +1,6 @@
 # PicoQMD
 
-**The search MCP server that fits where your agent does.** Single binary, ~11MB, runs on a Raspberry Pi Zero.
+**The search MCP server that fits where your agent does.** Single binary, ~15MB, runs on a Raspberry Pi Zero.
 
 Give any AI agent — [OpenClaw](https://github.com/openinterface/openclaw), [PicoClaw](https://github.com/sipeed/picoclaw), [MiniClaw](https://github.com/mattdef/miniclaw), [Claude Code](https://docs.anthropic.com/en/docs/claude-code), or your own — instant local search over any text files: code, docs, configs, notes. No cloud. No Node.js. No Python. Just a Go binary and SQLite.
 
