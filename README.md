@@ -1,6 +1,6 @@
 # PicoQMD
 
-**The search MCP server that fits where your agent does.** Single binary, ~9MB, runs on a Raspberry Pi Zero.
+**The search MCP server that fits where your agent does.** Single binary, ~11MB, runs on a Raspberry Pi Zero.
 
 Give any AI agent — [OpenClaw](https://github.com/openinterface/openclaw), [PicoClaw](https://github.com/sipeed/picoclaw), [MiniClaw](https://github.com/mattdef/miniclaw), [Claude Code](https://docs.anthropic.com/en/docs/claude-code), or your own — instant local search over any text files: code, docs, configs, notes. No cloud. No Node.js. No Python. Just a Go binary and SQLite.
 
@@ -8,12 +8,65 @@ Give any AI agent — [OpenClaw](https://github.com/openinterface/openclaw), [Pi
 
 Most search tools assume beefy hardware. PicoQMD is built for the other end of the spectrum:
 
-- **~9MB binary** — smaller than most npm installs
+- **~11MB binary** — smaller than most npm installs
 - **Minimal RAM** — BM25 mode needs almost nothing; runs alongside PicoClaw on $10 hardware
 - **Zero dependencies** — no runtime, no interpreters, no containers
 - **MCP native** — stdio and HTTP transports, works with any MCP-compatible agent
 - **Pure Go** — cross-compiles to ARM32, ARM64, RISC-V, x86 in one command
 - **Scales up** — add semantic vector search and hybrid re-ranking when your hardware allows
+- **Graceful degradation** — without models, vector/hybrid/research tools are hidden from the agent; BM25, get, and observations still work
+
+## What's New in v0.2.0
+
+### Composite `research` Tool
+
+One call replaces two. Runs BM25 + vector search in parallel, deduplicates results via Reciprocal Rank Fusion (K=60), and merges within a token budget — all server-side before results hit the agent's context window.
+
+```
+research({ query: "firebase auth flow", limit: 5, maxChars: 5000 })
+```
+
+Benchmark (3,145 docs indexed):
+
+| Approach | Time | Response Size |
+|----------|------|---------------|
+| search + vector_search (2 calls) | 1,585ms | 2,766 chars |
+| research (1 call) | 475ms | 1,351 chars |
+| **Savings** | **70% faster** | **51% fewer chars** |
+
+### `maxChars` — Server-Side Token Budget
+
+All search and retrieval tools now accept `maxChars` to truncate responses before they enter the context window. No more dumping entire files into agent context.
+
+```
+get({ ref: "MEMORY.md", maxChars: 500 })
+search({ query: "OSHA compliance", limit: 10, maxChars: 2000 })
+```
+
+### `note` — Observation-as-Sidecar
+
+Save insights in the same call as search — no separate tool call needed. Notes are linked to the top result's document ID and content hash.
+
+```
+search({ query: "severity colors", note: "defined in shared module SeverityLevel.kt" })
+```
+
+Observations are persisted to `~/.config/picoqmd/observations.json` and survive across sessions.
+
+### Stale Observation Flagging
+
+When a document's content changes after an observation was saved, the `research` tool automatically flags it `[STALE]` in results. The `status` tool reports the count of stale observations. No manual cleanup needed — stale context is surfaced, not silently persisted.
+
+### Graceful Degradation
+
+Without embedding models, the MCP server hides vector-dependent tools entirely:
+
+| Mode | Tools Exposed |
+|------|--------------|
+| **With models** | search, vector_search, deep_search, research, get, multi_get, status |
+| **Without models** | search, get, multi_get, status |
+
+The agent never sees tools it can't use. Instructions update to explain BM25-only mode. All new features (`maxChars`, `note`, stale flagging) work in both modes.
 
 ## Quick Start
 
@@ -34,19 +87,17 @@ picoqmd search "deploy"          # matches "deployment", "deployed", "deploying"
 
 ## MCP Server
 
-PicoQMD is an MCP server first. Point your agent at it and get `search`, `get`, `multi_get`, `status` — plus `vector_search` and `deep_search` when models are available.
+PicoQMD is an MCP server first. Point your agent at it and get `search`, `get`, `multi_get`, `status` — plus `vector_search`, `deep_search`, and `research` when models are available.
 
 ### Claude Code
 
-Add to `~/.claude/mcp.json`:
+Add to `~/.claude/settings.json` under `mcpServers`:
 
 ```json
 {
-  "mcpServers": {
-    "picoqmd": {
-      "command": "picoqmd",
-      "args": ["mcp"]
-    }
+  "picoqmd": {
+    "command": "picoqmd",
+    "args": ["mcp"]
   }
 }
 ```
@@ -67,6 +118,29 @@ picoqmd mcp --http :8181
 
 Any agent that speaks [Model Context Protocol](https://modelcontextprotocol.io/) can connect. The MCP server exposes the same search tools whether you're on a Mac Studio or a Pi Zero.
 
+## MCP Tools Reference
+
+| Tool | Description | Requires Models |
+|------|-------------|----------------|
+| `search` | BM25 keyword search via SQLite FTS5 with prefix matching | No |
+| `vector_search` | Semantic similarity using embeddings | Yes |
+| `deep_search` | Query expansion + fan-out + RRF + re-ranking | Yes |
+| `research` | Composite: BM25 + vector in parallel, deduplicated via RRF | Yes |
+| `get` | Retrieve single document by path or docid | No |
+| `multi_get` | Batch retrieve by glob pattern or comma-separated list | No |
+| `status` | Index health, collection inventory, stale observation count | No |
+
+**Common parameters** across search tools:
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `query` | string | Search query (required) |
+| `limit` | int | Max results, default 10 |
+| `collection` | string | Filter to a specific collection |
+| `minScore` | float | Minimum relevance score 0-1 |
+| `maxChars` | int | Truncate response to this many characters |
+| `note` | string | Save an observation linked to the top result |
+
 ## Two Modes
 
 ### BM25 Only — For Edge and Constrained Devices
@@ -77,7 +151,7 @@ picoqmd add ~/src --glob "**/*.{go,py,rs,ts,js}" --no-embed
 picoqmd search "meeting notes"
 ```
 
-No models, no llama.cpp, no downloads. Just Go + SQLite FTS5 with prefix matching. This is the mode for PicoClaw-class devices where every megabyte counts. The binary is ~9MB, runtime memory is minimal, and search is instant.
+No models, no llama.cpp, no downloads. Just Go + SQLite FTS5 with prefix matching. This is the mode for PicoClaw-class devices where every megabyte counts. The binary is ~11MB, runtime memory is minimal, and search is instant.
 
 ### Vector + Hybrid — For Capable Hardware
 
@@ -167,6 +241,7 @@ PicoQMD automatically skips binary files, files over 1MB, and common noise direc
 - **Claude Code MCP server** — fast, local search over large codebases without spinning up Elasticsearch
 - **Edge AI knowledge base** — deploy searchable documentation to field devices, kiosks, or air-gapped environments
 - **Offline dev search** — index API docs, READMEs, and notes for airplane-mode development
+- **Token-efficient MCP pipelines** — use `research` to cut context window usage by ~50% vs separate search calls
 
 ## Acknowledgments
 

@@ -39,6 +39,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"time"
 	"unicode/utf8"
 
 	"github.com/spf13/cobra"
@@ -52,7 +53,7 @@ import (
 // ---------------------------------------------------------------------------
 
 const (
-	version           = "0.1.0"
+	version           = "0.2.0"
 	defaultDB         = "index.sqlite"
 	chunkTarget       = 900  // target tokens per chunk
 	chunkLookback     = 200  // tokens to look back for break points
@@ -1168,10 +1169,12 @@ func (m *MCPServer) buildInstructions() string {
 	}
 	hasEmbed := modelExists(m.engine.ModelsDir(), defaultModels[0].Filename)
 	if hasEmbed {
-		sb.WriteString("\nTools: search (BM25), vector_search (semantic), deep_search (hybrid), get, multi_get, status\n")
+		sb.WriteString("\nTools: search (BM25), vector_search (semantic), deep_search (hybrid), research (composite BM25+vector), get, multi_get, status\n")
+		sb.WriteString("\nPrefer `research` over calling search + vector_search separately — it deduplicates and merges server-side.\n")
+		sb.WriteString("All search tools support `maxChars` to cap response size and `note` to save an observation linked to the top result.\n")
 	} else {
 		sb.WriteString("\nTools: search (BM25), get, multi_get, status\n")
-		sb.WriteString("Note: Running in BM25-only mode. Install embedding models for vector/hybrid search.\n")
+		sb.WriteString("Note: Running in BM25-only mode. Install embedding models for vector/hybrid/research.\n")
 	}
 	return sb.String()
 }
@@ -1182,6 +1185,8 @@ func (m *MCPServer) toolDefinitions() []map[string]any {
 		"limit":      map[string]any{"type": "integer", "description": "Max results (default 10)"},
 		"collection": map[string]any{"type": "string", "description": "Filter to a specific collection"},
 		"minScore":   map[string]any{"type": "number", "description": "Minimum score threshold (default 0)"},
+		"maxChars":   map[string]any{"type": "integer", "description": "Truncate total response to this many characters (server-side token budget)"},
+		"note":       map[string]any{"type": "string", "description": "Save an observation linked to the top result (persisted across sessions, auto-flagged stale when source changes)"},
 	}, "required": []string{"query"}}
 
 	tools := []map[string]any{
@@ -1198,10 +1203,22 @@ func (m *MCPServer) toolDefinitions() []map[string]any {
 				"limit":      map[string]any{"type": "integer", "description": "Max results (default 10)"},
 				"collection": map[string]any{"type": "string", "description": "Filter to a specific collection"},
 				"minScore":   map[string]any{"type": "number", "description": "Minimum score threshold (default 0.3)"},
+				"maxChars":   map[string]any{"type": "integer", "description": "Truncate total response to this many characters"},
+				"note":       map[string]any{"type": "string", "description": "Save an observation linked to the top result"},
 			}, "required": []string{"query"}}})
 		tools = append(tools, map[string]any{
 			"name": "deep_search", "description": "Full hybrid pipeline: auto-expands query into variations, searches each by keyword and meaning, reranks for top hits",
 			"inputSchema": searchSchema})
+		tools = append(tools, map[string]any{
+			"name": "research", "description": "Composite search: runs BM25 + vector in parallel, deduplicates by docid via RRF, and merges within a token budget. One call instead of two.",
+			"inputSchema": map[string]any{"type": "object", "properties": map[string]any{
+				"query":      map[string]any{"type": "string", "description": "Search query"},
+				"limit":      map[string]any{"type": "integer", "description": "Max results (default 10)"},
+				"collection": map[string]any{"type": "string", "description": "Filter to a specific collection"},
+				"minScore":   map[string]any{"type": "number", "description": "Minimum score threshold (default 0)"},
+				"maxChars":   map[string]any{"type": "integer", "description": "Truncate total response to this many characters (default: no limit)"},
+				"note":       map[string]any{"type": "string", "description": "Save an observation linked to the top result"},
+			}, "required": []string{"query"}}})
 	}
 
 	tools = append(tools,
@@ -1209,11 +1226,13 @@ func (m *MCPServer) toolDefinitions() []map[string]any {
 			"inputSchema": map[string]any{"type": "object", "properties": map[string]any{
 				"ref":      map[string]any{"type": "string", "description": "File path, docid (#abc123), or path:line"},
 				"maxLines": map[string]any{"type": "integer", "description": "Maximum lines to return"},
+				"maxChars": map[string]any{"type": "integer", "description": "Truncate response to this many characters"},
 			}, "required": []string{"ref"}}},
 		map[string]any{"name": "multi_get", "description": "Retrieve multiple documents by glob pattern or comma-separated list",
 			"inputSchema": map[string]any{"type": "object", "properties": map[string]any{
 				"pattern":  map[string]any{"type": "string", "description": "Glob pattern (e.g., docs/*.md) or comma-separated paths"},
 				"maxBytes": map[string]any{"type": "integer", "description": "Skip files over this size (default 10240)"},
+				"maxChars": map[string]any{"type": "integer", "description": "Truncate total response to this many characters"},
 			}, "required": []string{"pattern"}}},
 		map[string]any{"name": "status", "description": "Index health: collection inventory, document counts, embedding status",
 			"inputSchema": map[string]any{"type": "object", "properties": map[string]any{}}},
@@ -1240,6 +1259,8 @@ func (m *MCPServer) callTool(params json.RawMessage) (any, error) {
 		MinScore   float64 `json:"minScore"`
 		MaxBytes   int     `json:"maxBytes"`
 		MaxLines   int     `json:"maxLines"`
+		MaxChars   int     `json:"maxChars"`
+		Note       string  `json:"note"`
 	}
 	if err := json.Unmarshal(call.Arguments, &args); err != nil {
 		return nil, fmt.Errorf("invalid tool arguments: %w", err)
@@ -1264,13 +1285,48 @@ func (m *MCPServer) callTool(params json.RawMessage) (any, error) {
 		return filtered
 	}
 
+	// Helper: apply maxChars truncation to a tool result
+	applyMaxChars := func(result map[string]any, maxChars int) map[string]any {
+		if maxChars <= 0 {
+			return result
+		}
+		content, ok := result["content"].([]map[string]any)
+		if !ok || len(content) == 0 {
+			return result
+		}
+		text, ok := content[0]["text"].(string)
+		if !ok || len(text) <= maxChars {
+			return result
+		}
+		content[0]["text"] = text[:maxChars] + "\n\n[... truncated to " + fmt.Sprintf("%d", maxChars) + " chars]"
+		return result
+	}
+
+	// Helper: save observation note linked to a docid
+	saveNote := func(results []SearchResult, note string) {
+		if note == "" || len(results) == 0 {
+			return
+		}
+		top := results[0]
+		obs := Observation{
+			DocID:     top.DocID,
+			Path:      top.Path,
+			Hash:      m.getDocHash(top.DocID),
+			Note:      note,
+			Timestamp: fmt.Sprintf("%d", time.Now().Unix()),
+		}
+		saveObservation(m.observationsPath(), obs)
+	}
+
 	switch call.Name {
 	case "search":
 		results, err := m.store.SearchBM25(args.Query, args.Limit)
 		if err != nil {
 			return nil, err
 		}
-		return toolResult(filterMinScore(results, args.MinScore)), nil
+		filtered := filterMinScore(results, args.MinScore)
+		saveNote(filtered, args.Note)
+		return applyMaxChars(toolResult(filtered), args.MaxChars), nil
 
 	case "vector_search":
 		qvec, err := m.engine.Embed(args.Query, true)
@@ -1285,43 +1341,153 @@ func (m *MCPServer) callTool(params json.RawMessage) (any, error) {
 		if minScore == 0 {
 			minScore = 0.3
 		}
-		return toolResult(filterMinScore(results, minScore)), nil
+		filtered := filterMinScore(results, minScore)
+		saveNote(filtered, args.Note)
+		return applyMaxChars(toolResult(filtered), args.MaxChars), nil
 
 	case "deep_search":
 		results, err := m.hybrid.Search(context.Background(), args.Query, args.Limit)
 		if err != nil {
 			return nil, err
 		}
-		return toolResult(filterMinScore(results, args.MinScore)), nil
+		filtered := filterMinScore(results, args.MinScore)
+		saveNote(filtered, args.Note)
+		return applyMaxChars(toolResult(filtered), args.MaxChars), nil
+
+	case "research":
+		// Composite: BM25 + vector search, deduplicated via RRF
+		bm25Results, _ := m.store.SearchBM25(args.Query, args.Limit*2)
+		var vecResults []SearchResult
+		if qvec, err := m.engine.Embed(args.Query, true); err == nil {
+			vecResults, _ = m.store.SearchVector(qvec, args.Limit*2)
+		}
+		merged := simpleRRF(bm25Results, vecResults, args.Limit)
+		filtered := filterMinScore(merged, args.MinScore)
+		// Attach stale observations to results
+		stale := getStaleObservations(m.observationsPath(), m.store)
+		if len(stale) > 0 {
+			staleMap := make(map[string]string)
+			for _, s := range stale {
+				staleMap[s.DocID] = s.Note
+			}
+			for i, r := range filtered {
+				if note, ok := staleMap[r.DocID]; ok {
+					filtered[i].Context += " [STALE observation: " + note + "]"
+				}
+			}
+		}
+		saveNote(filtered, args.Note)
+		return applyMaxChars(toolResult(filtered), args.MaxChars), nil
 
 	case "get":
 		doc, err := m.store.GetDocument(args.Ref)
 		if err != nil {
 			return nil, err
 		}
-		return toolResult(doc), nil
+		return applyMaxChars(toolResult(doc), args.MaxChars), nil
 
 	case "multi_get":
 		docs, err := m.store.MultiGet(args.Pattern)
 		if err != nil {
 			return nil, err
 		}
-		return toolResult(docs), nil
+		return applyMaxChars(toolResult(docs), args.MaxChars), nil
 
 	case "status":
 		cols, docs, chunks, _ := m.store.Stats()
 		unembedded, _ := m.store.UnembeddedHashes()
+		stale := getStaleObservations(m.observationsPath(), m.store)
 		return toolResult(map[string]any{
-			"collections":    cols,
-			"documents":      docs,
-			"chunks":         chunks,
-			"needsEmbedding": len(unembedded),
-			"hasVectorIndex": len(unembedded) == 0 && chunks > 0,
+			"collections":       cols,
+			"documents":         docs,
+			"chunks":            chunks,
+			"needsEmbedding":    len(unembedded),
+			"hasVectorIndex":    len(unembedded) == 0 && chunks > 0,
+			"staleObservations": len(stale),
 		}), nil
 
 	default:
 		return nil, fmt.Errorf("unknown tool: %s", call.Name)
 	}
+}
+
+// ---------------------------------------------------------------------------
+// Observations — persistent notes linked to document docids
+// ---------------------------------------------------------------------------
+
+type Observation struct {
+	DocID     string `json:"docid"`
+	Path      string `json:"path"`
+	Hash      string `json:"hash"` // content hash at time of observation
+	Note      string `json:"note"`
+	Timestamp string `json:"timestamp"`
+	Stale     bool   `json:"stale,omitempty"`
+}
+
+
+func (m *MCPServer) observationsPath() string {
+	dir := os.Getenv("XDG_CONFIG_HOME")
+	if dir == "" {
+		home, _ := os.UserHomeDir()
+		dir = filepath.Join(home, ".config")
+	}
+	return filepath.Join(dir, "picoqmd", "observations.json")
+}
+
+func (m *MCPServer) getDocHash(docid string) string {
+	doc, err := m.store.GetDocument(docid)
+	if err != nil {
+		return ""
+	}
+	return doc.Hash
+}
+
+func saveObservation(path string, obs Observation) {
+	var observations []Observation
+	if data, err := os.ReadFile(path); err == nil {
+		json.Unmarshal(data, &observations)
+	}
+	// Update existing observation for same docid, or append
+	found := false
+	for i, o := range observations {
+		if o.DocID == obs.DocID {
+			observations[i] = obs
+			found = true
+			break
+		}
+	}
+	if !found {
+		observations = append(observations, obs)
+	}
+	os.MkdirAll(filepath.Dir(path), 0o755)
+	data, _ := json.MarshalIndent(observations, "", "  ")
+	os.WriteFile(path, data, 0o644)
+}
+
+func getStaleObservations(path string, store *Store) []Observation {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil
+	}
+	var observations []Observation
+	if err := json.Unmarshal(data, &observations); err != nil {
+		return nil
+	}
+	var stale []Observation
+	for _, obs := range observations {
+		doc, err := store.GetDocument(obs.DocID)
+		if err != nil {
+			// Document deleted — observation is stale
+			obs.Stale = true
+			stale = append(stale, obs)
+			continue
+		}
+		if doc.Hash != obs.Hash {
+			obs.Stale = true
+			stale = append(stale, obs)
+		}
+	}
+	return stale
 }
 
 func toolResult(data any) map[string]any {
