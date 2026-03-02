@@ -1,0 +1,19 @@
+# Binary
+picoqmd
+*.exe
+
+# Test binaries
+*.test
+
+# Dev scripts
+compare.sh
+
+# OS
+.DS_Store
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
