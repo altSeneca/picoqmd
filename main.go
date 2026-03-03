@@ -901,7 +901,7 @@ func (s *Store) SkipNextUnembedded() error {
 
 	dummyVec := make([]byte, 4)
 	return sqlitex.Execute(conn, `
-		INSERT OR IGNORE INTO content_vectors (hash, seq, text, vec) VALUES (?, 0, '[skipped]', ?)
+		INSERT OR IGNORE INTO content_vectors (hash, seq, pos, text, vec) VALUES (?, 0, 0, '[skipped]', ?)
 	`, &sqlitex.ExecOptions{
 		Args: []any{hash, dummyVec},
 	})

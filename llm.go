@@ -890,11 +890,11 @@ func embedAll(store *Store) error {
 
 		if err != nil {
 			fmt.Printf("  Worker exited (%v), embedded %d docs in this batch. Restarting...\n", err, batchDone)
-			if batchDone == 0 {
-				fmt.Println("  No progress — skipping problematic document")
-				if skipErr := store.SkipNextUnembedded(); skipErr != nil {
-					return fmt.Errorf("failed to skip document: %w", skipErr)
-				}
+		}
+		if batchDone == 0 {
+			fmt.Println("  No progress — skipping problematic document")
+			if skipErr := store.SkipNextUnembedded(); skipErr != nil {
+				return fmt.Errorf("failed to skip document: %w", skipErr)
 			}
 			continue
 		}
