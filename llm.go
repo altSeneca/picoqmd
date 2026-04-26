@@ -851,17 +851,26 @@ func embedAll(store *Store) error {
 		return err
 	}
 	if total == 0 {
-		fmt.Println("  All documents already embedded")
+		infof("  All documents already embedded\n")
 		return nil
 	}
 
-	fmt.Printf("  Embedding %d documents...\n", total)
+	infof("  Embedding %d documents...\n", total)
 	start := time.Now()
 	embedded := 0
 
 	selfBin, err := os.Executable()
 	if err != nil {
 		return fmt.Errorf("cannot find own binary: %w", err)
+	}
+
+	// When quiet, discard the worker subprocess's stdout/stderr instead
+	// of inheriting the parent's. Otherwise the worker's per-chunk
+	// progress lines would still flow through to a launchd-captured log
+	// even though embedAll itself is silent.
+	var workerOut, workerErr io.Writer = os.Stdout, os.Stderr
+	if quiet {
+		workerOut, workerErr = io.Discard, io.Discard
 	}
 
 	const batchSize = 500
@@ -875,9 +884,12 @@ func embedAll(store *Store) error {
 		}
 
 		args := []string{"embed-worker", "--batch", strconv.Itoa(batchSize)}
+		if quiet {
+			args = append(args, "--quiet")
+		}
 		cmd := exec.Command(selfBin, args...)
-		cmd.Stdout = os.Stdout
-		cmd.Stderr = os.Stderr
+		cmd.Stdout = workerOut
+		cmd.Stderr = workerErr
 		cmd.Env = os.Environ()
 
 		err = cmd.Run()
@@ -889,18 +901,23 @@ func embedAll(store *Store) error {
 		embedded += batchDone
 
 		if err != nil {
-			fmt.Printf("  Worker exited (%v), embedded %d docs in this batch. Restarting...\n", err, batchDone)
+			// Worker errors go to the log facility (rate-limited by
+			// the runtime, not per-line) rather than direct stdout, so
+			// they're useful for debugging without becoming the source
+			// of unbounded log growth on chronic failures.
+			log.Printf("  worker exited (%v), embedded %d docs in this batch", err, batchDone)
 		}
 		if batchDone == 0 {
-			fmt.Println("  No progress — skipping problematic document")
+			infof("  No progress — skipping problematic document\n")
 			if skipErr := store.SkipNextUnembedded(); skipErr != nil {
 				return fmt.Errorf("failed to skip document: %w", skipErr)
 			}
 			continue
 		}
-		fmt.Printf("  %d/%d documents embedded\n", total-newRemaining, total)
+		infof("  %d/%d documents embedded\n", total-newRemaining, total)
 	}
 
+	// Final summary always prints — one line per invocation, bounded.
 	fmt.Printf("  Embedding done: %d documents (%s)\n", embedded, time.Since(start).Round(time.Second))
 	return nil
 }
@@ -974,11 +991,17 @@ func embedWorker(maxDocs int) error {
 		}
 
 		if (i+1)%10 == 0 {
-			fmt.Printf("  [worker] %d/%d docs\n", i+1, len(hashes))
+			infof("  [worker] %d/%d docs\n", i+1, len(hashes))
 		}
 	}
 
+	// One-shot summary — always prints. Bounded at one line per worker invocation.
 	embedded := len(hashes) - skipCount
+	if quiet {
+		// Discard mode: even the summary goes nowhere, since the parent
+		// already logs the per-batch totals on its own bounded line.
+		return nil
+	}
 	fmt.Printf("  [worker] done: %d docs", embedded)
 	if embedErrors > 0 {
 		fmt.Printf(" (%d chunk errors)", embedErrors)

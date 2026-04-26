@@ -129,6 +129,13 @@ type progressWriter struct {
 func (pw *progressWriter) Write(p []byte) (int, error) {
 	n := len(p)
 	pw.written += int64(n)
+	// In non-interactive mode (launchd, cron, pipes) the carriage-return
+	// based progress bar accumulates as garbage in the captured log.
+	// Skip it entirely; the caller still gets the bytes written via the
+	// io.Writer return contract.
+	if !progressEnabled() {
+		return n, nil
+	}
 	barLen := 30
 	if pw.total > 0 {
 		pct := float64(pw.written) / float64(pw.total) * 100
@@ -147,5 +154,7 @@ func (pw *progressWriter) Write(p []byte) (int, error) {
 }
 
 func (pw *progressWriter) finish() {
-	fmt.Fprintln(os.Stderr)
+	if progressEnabled() {
+		fmt.Fprintln(os.Stderr)
+	}
 }

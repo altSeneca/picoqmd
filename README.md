@@ -4,6 +4,18 @@
 
 Give any AI agent — [OpenClaw](https://github.com/openinterface/openclaw), [PicoClaw](https://github.com/sipeed/picoclaw), [MiniClaw](https://github.com/mattdef/miniclaw), [Claude Code](https://docs.anthropic.com/en/docs/claude-code), or your own — instant local search over any text files: code, docs, configs, notes. No cloud. No Node.js. No Python. Just a Go binary and SQLite.
 
+## Running under launchd / cron / systemd
+
+picoqmd auto-detects when stdout is not a terminal (launchd, cron, pipes,
+`tee >file`) and suppresses per-document progress output to keep
+captured-stdout log files bounded. Force the behavior with `--quiet` or
+override it with `--verbose`. See [CHANGELOG.md](CHANGELOG.md) for v0.2.2
+details.
+
+If you previously ran picoqmd under launchd before v0.2.2, your
+StandardOutPath log file may be very large — safely truncate it with
+`: > /path/to/your/picoqmd.log`.
+
 ## Why PicoQMD?
 
 Most search tools assume beefy hardware. PicoQMD is built for the other end of the spectrum:

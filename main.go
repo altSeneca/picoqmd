@@ -53,7 +53,7 @@ import (
 // ---------------------------------------------------------------------------
 
 const (
-	version           = "0.2.1"
+	version           = "0.2.2"
 	defaultDB         = "index.sqlite"
 	chunkTarget       = 900  // target tokens per chunk
 	chunkLookback     = 200  // tokens to look back for break points
@@ -2102,7 +2102,47 @@ func addFileToTar(tw *tar.Writer, filePath, name string) error {
 // CLI — cobra commands
 // ---------------------------------------------------------------------------
 
+// quiet suppresses per-document progress output so picoqmd can run under
+// launchd/cron without filling its captured-stdout log file. It is
+// auto-enabled when stdout is not a terminal (pipes, files, launchd) and
+// can be forced on/off via --quiet/--verbose. Read by helpers in llm.go
+// and engine.go via the infof / progressEnabled accessors.
+var quiet bool
+
+// infof writes a progress line to stdout only when quiet is false.
+// Use it for "this happened, here's the count" loop output.
+// Reserve direct fmt.Print for one-shot final summaries that should
+// always render (errors, totals).
+func infof(format string, args ...any) {
+	if !quiet {
+		fmt.Printf(format, args...)
+	}
+}
+
+// progressEnabled reports whether progress UI (download bars, redraws)
+// should render. Always false when quiet is set.
+func progressEnabled() bool { return !quiet }
+
+// stdoutIsTerminal returns true when os.Stdout is attached to an
+// interactive terminal. False under launchd, cron, pipes, or `tee >file`.
+// We use the Stat mode rather than golang.org/x/term to avoid pulling
+// in a new dependency for one boolean.
+func stdoutIsTerminal() bool {
+	fi, err := os.Stdout.Stat()
+	if err != nil {
+		return false
+	}
+	return (fi.Mode() & os.ModeCharDevice) != 0
+}
+
 func main() {
+	// Default --quiet to true when stdout is not a terminal so launchd /
+	// cron / piped invocations don't grow log files unboundedly.
+	// Users on a real terminal still see progress output.
+	if !stdoutIsTerminal() {
+		quiet = true
+	}
+
 	var indexName string
 	var searchLimit int
 	var searchFormat string
@@ -2184,6 +2224,16 @@ Quick start:
 	root.PersistentFlags().IntVar(&searchLimit, "limit", 10, "max search results")
 	root.PersistentFlags().StringVar(&searchFormat, "format", "text", "output: text, json, csv, md, files")
 	root.PersistentFlags().StringVar(&remoteAddr, "remote", "", "forward searches to remote picoqmd MCP server (host:port)")
+	root.PersistentFlags().BoolVar(&quiet, "quiet", quiet, "suppress per-document progress output (auto-enabled when stdout is not a terminal)")
+	root.PersistentFlags().BoolVar(new(bool), "verbose", false, "force progress output even when stdout is not a terminal")
+	// --verbose overrides the auto-quiet behavior. We can't share a single
+	// bool with --quiet (cobra rejects that), so we fix it up after parse:
+	root.PersistentPreRunE = func(cmd *cobra.Command, args []string) error {
+		if v, _ := cmd.Flags().GetBool("verbose"); v {
+			quiet = false
+		}
+		return nil
+	}
 
 	// --- add (top-level) ---
 	addRunE := func(cmd *cobra.Command, args []string) error {
