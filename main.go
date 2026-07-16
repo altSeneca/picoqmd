@@ -55,7 +55,7 @@ import (
 // ---------------------------------------------------------------------------
 
 const (
-	version       = "0.4.1"
+	version       = "0.4.2"
 	defaultDB     = "index.sqlite"
 	chunkTarget   = 900 // target tokens per chunk
 	chunkLookback = 200 // tokens to look back for break points
@@ -2538,27 +2538,41 @@ func ftsString(term string) string {
 
 // toFTS5Query converts a free-text query into FTS5 MATCH syntax that can
 // never produce a syntax error: every term is emitted as a quoted string
-// (see ftsString), with a trailing * on unquoted terms for prefix matching.
-// User-quoted phrases are preserved without the prefix star. Returns "" when
-// nothing searchable remains — callers must skip the MATCH entirely.
+// (see ftsString). Only the LAST unquoted term gets a trailing * — prefix
+// expansion on every word made long natural-language queries scan the whole
+// term index (`"the"*` over a book corpus enumerates a huge posting range
+// per term), and porter stemming already matches morphological variants of
+// interior terms. Stopword terms are dropped when at least one meaningful
+// term remains: they carry ~zero BM25 weight (high document frequency) but
+// cost a full doclist intersection each. User-quoted phrases are preserved
+// verbatim. Returns "" when nothing searchable remains — callers must skip
+// the MATCH entirely.
 func toFTS5Query(query string) string {
 	words := strings.Fields(query)
 
-	var parts []string
+	type part struct {
+		text      string // quoted FTS5 string, no star
+		starrable bool   // unquoted term (user phrases never get a star)
+		stopword  bool
+	}
+	var parts []part
 	inPhrase := false
 	var phrase []string
+	hasContent := false // at least one non-stopword unquoted term seen
 
-	appendTerm := func(w string, prefix bool) {
-		if q := ftsString(strings.Trim(w, `"'`)); q != "" {
-			if prefix {
-				q += "*"
+	appendTerm := func(w string) {
+		w = strings.Trim(w, `"'`)
+		if q := ftsString(w); q != "" {
+			stop := snippetStopWords[strings.ToLower(w)]
+			parts = append(parts, part{text: q, starrable: true, stopword: stop})
+			if !stop {
+				hasContent = true
 			}
-			parts = append(parts, q)
 		}
 	}
 	appendPhrase := func(ws []string) {
 		if q := ftsString(strings.Join(ws, " ")); q != "" {
-			parts = append(parts, q)
+			parts = append(parts, part{text: q})
 		}
 	}
 
@@ -2584,18 +2598,41 @@ func toFTS5Query(query string) string {
 			}
 			continue
 		}
-		// Unquoted word — quoted string with prefix matching
-		appendTerm(w, true)
+		appendTerm(w)
 	}
 
-	// Unclosed quote — treat remaining words as prefix terms
+	// Unclosed quote — treat remaining words as plain terms
 	if inPhrase {
 		for _, w := range phrase {
-			appendTerm(w, true)
+			appendTerm(w)
 		}
 	}
 
-	return strings.Join(parts, " AND ")
+	// Drop stopword terms, but only when a meaningful term survives —
+	// an all-stopword query ("to be or not to be") keeps everything.
+	if hasContent {
+		kept := parts[:0]
+		for _, p := range parts {
+			if !p.stopword {
+				kept = append(kept, p)
+			}
+		}
+		parts = kept
+	}
+
+	// Prefix-star the last unquoted term (search-as-you-type semantics).
+	for i := len(parts) - 1; i >= 0; i-- {
+		if parts[i].starrable {
+			parts[i].text += "*"
+			break
+		}
+	}
+
+	out := make([]string, len(parts))
+	for i, p := range parts {
+		out[i] = p.text
+	}
+	return strings.Join(out, " AND ")
 }
 
 func cosineSim(a, b []float32) float64 {

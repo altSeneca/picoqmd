@@ -17,17 +17,25 @@ func TestToFTS5Query(t *testing.T) {
 		want string
 	}{
 		{"hello", `"hello"*`},
-		{"hello world", `"hello"* AND "world"*`},
+		// Only the LAST term gets prefix expansion — starring every term made
+		// long queries enumerate huge posting ranges; porter stemming covers
+		// interior-term morphology.
+		{"hello world", `"hello" AND "world"*`},
 		{`"exact phrase" loose`, `"exact phrase" AND "loose"*`},
 		{`"single"`, `"single"`},
 		// Dots: version strings must not produce FTS5 syntax errors
 		{"v3.9.7", `"v3.9.7"*`},
 		{"2026.4.10", `"2026.4.10"*`},
 		// Hyphens
-		{"real-time sync", `"real-time"* AND "sync"*`},
-		// FTS5 operator words must be neutralized
+		{"real-time sync", `"real-time" AND "sync"*`},
+		// FTS5 operator words must be neutralized. NOT is not a stopword.
+		{"cats NOT dogs", `"cats" AND "NOT" AND "dogs"*`},
+		// Stopwords are dropped when meaningful terms remain…
+		{"how does the state of calm improve suggestions", `"how" AND "does" AND "state" AND "calm" AND "improve" AND "suggestions"*`},
+		{"deploy to the server", `"deploy" AND "server"*`},
+		// …but an all-stopword query keeps everything.
+		{"to be or", `"to" AND "be" AND "or"*`},
 		{"AND", `"AND"*`},
-		{"cats NOT dogs", `"cats"* AND "NOT"* AND "dogs"*`},
 		// Punctuation-only tokens are dropped
 		{"foo ---", `"foo"*`},
 		{"...", ""},

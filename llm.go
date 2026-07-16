@@ -87,10 +87,32 @@ func (e *LLMEngine) init() error {
 	if err := llama.Load(loadPath); err != nil {
 		return fmt.Errorf("unable to load llama.cpp library: %w", err)
 	}
-	llama.LogSet(llama.LogSilent())
+	// PICOQMD_LLAMA_DEBUG=1 keeps llama.cpp's native logging (device
+	// detection, layer offload) on stderr for diagnosing GPU issues.
+	if os.Getenv("PICOQMD_LLAMA_DEBUG") == "" {
+		llama.LogSet(llama.LogSilent())
+	}
 	llama.Init()
 	e.inited = true
 	return nil
+}
+
+// modelParams returns default model params with full GPU offload requested.
+// llama.cpp's dynamic-backend builds default to 0 GPU layers (pure CPU), so
+// the Metal backend shipped in the runtime bundle was never used — the
+// hybrid pipeline ran ~2.5× slower than qmd on the same models. Offloading
+// is a no-op when no GPU backend is available. Override with
+// PICOQMD_GPU_LAYERS (0 forces CPU).
+func modelParams() llama.ModelParams {
+	p := llama.ModelDefaultParams()
+	ngl := int32(999)
+	if v := os.Getenv("PICOQMD_GPU_LAYERS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 0 {
+			ngl = int32(n)
+		}
+	}
+	p.NGpuLayers = ngl
+	return p
 }
 
 func (e *LLMEngine) ensureEmbedModel() error {
@@ -108,7 +130,7 @@ func (e *LLMEngine) ensureEmbedModel() error {
 		return fmt.Errorf("embedding model not found at %s — download with: picoqmd model download embedding", modelPath)
 	}
 
-	model, err := llama.ModelLoadFromFile(modelPath, llama.ModelDefaultParams())
+	model, err := llama.ModelLoadFromFile(modelPath, modelParams())
 	if err != nil {
 		return fmt.Errorf("failed to load embedding model: %w", err)
 	}
@@ -149,7 +171,7 @@ func (e *LLMEngine) ensureRerankModel() error {
 		return fmt.Errorf("reranker model not found at %s", modelPath)
 	}
 
-	model, err := llama.ModelLoadFromFile(modelPath, llama.ModelDefaultParams())
+	model, err := llama.ModelLoadFromFile(modelPath, modelParams())
 	if err != nil {
 		return fmt.Errorf("failed to load reranker model: %w", err)
 	}
@@ -185,7 +207,7 @@ func (e *LLMEngine) ensureExpandModel() error {
 		return fmt.Errorf("expansion model not found at %s", modelPath)
 	}
 
-	model, err := llama.ModelLoadFromFile(modelPath, llama.ModelDefaultParams())
+	model, err := llama.ModelLoadFromFile(modelPath, modelParams())
 	if err != nil {
 		return fmt.Errorf("failed to load expansion model: %w", err)
 	}

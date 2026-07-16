@@ -1,5 +1,30 @@
 # Changelog
 
+## [0.4.2] - 2026-07-16
+
+### Performance
+
+- **Hybrid search 96s → ~7s on a 10.8K-doc index** (measured, M-series;
+  now ~6× faster than qmd's Node pipeline on the same corpus and models).
+  Two independent fixes:
+  - **FTS5 prefix explosion.** Every query term used to get a trailing `*`;
+    on long natural-language queries (exactly what the query-expansion model
+    emits) each `"the"*`-style term enumerated a huge posting range, so one
+    14-term BM25 query took 9s and the hybrid fan-out multiplied that.
+    Now only the last term is prefix-starred (search-as-you-type semantics;
+    porter stemming already covers interior-term morphology) and stopword
+    terms are dropped whenever a meaningful term remains (they carry ~zero
+    BM25 weight at full doclist-intersection cost). 14-term query: 9s → 0.4s.
+  - **Metal/GPU offload was never requested.** llama.cpp's dynamic-backend
+    builds default to 0 GPU layers; the Metal backend shipped in the runtime
+    bundle sat unused. All three models now load with full offload
+    (`PICOQMD_GPU_LAYERS` overrides; `0` forces CPU).
+
+### Added
+
+- `PICOQMD_LLAMA_DEBUG=1` keeps llama.cpp's native logging on stderr
+  (device detection, layer offload) for diagnosing GPU issues.
+
 ## [0.4.1] - 2026-07-16
 
 ### Fixed

@@ -14,13 +14,11 @@ vectors, weighted RRF fusion, EmbeddingGemma-300M-Q8 + Qwen3 reranker +
 ## Sequenced plan
 
 ### Phase 1 — cheap + fresh
-0. **Metal/GPU offload for the LLM stages.** Measured on M-series: full
-   hybrid (expansion 1.7B + rerank 0.6B) takes ~98s CPU-bound vs qmd's ~39s
-   (node-llama-cpp offloads to Metal). yzma exposes `NGpuLayers`
-   (`llama.go:299`) but picoqmd leaves the default. Set `NGpuLayers: 99` in
-   the three `ModelDefaultParams()` call sites, verify Metal engages and
-   output is unchanged. Fast paths are unaffected (BM25 70ms, vsearch 0.5s
-   over ~24K real vectors).
+0. ~~**Metal/GPU offload for the LLM stages.**~~ **DONE in v0.4.2** — and the
+   investigation found the real bottleneck was FTS5 prefix explosion on
+   expansion-generated long queries, not the missing offload. Both fixed:
+   hybrid 96s → ~7s (6× faster than qmd), 14-term BM25 9s → 0.4s. Fast paths
+   unchanged (BM25 70ms, vsearch 0.5s over ~24K vectors).
 1. **Matryoshka truncation 768→256** (~10 lines, no deps).
    EmbeddingGemma is MRL-trained: `vec[:256]` + L2-renormalize. −2.4% MTEB,
    exact 3× smaller disk/RAM and 3× faster brute-force scan (fewer BLOB bytes
