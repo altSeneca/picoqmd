@@ -37,14 +37,16 @@ import (
 	"path/filepath"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 	"unicode/utf8"
 
 	"github.com/spf13/cobra"
 	"gopkg.in/yaml.v3"
-	"zombiezen.com/go/sqlite"       // Pure Go SQLite — no CGO
+	"zombiezen.com/go/sqlite" // Pure Go SQLite — no CGO
 	"zombiezen.com/go/sqlite/sqlitex"
 )
 
@@ -53,13 +55,17 @@ import (
 // ---------------------------------------------------------------------------
 
 const (
-	version           = "0.3.0"
-	defaultDB         = "index.sqlite"
-	chunkTarget       = 900  // target tokens per chunk
-	chunkLookback     = 200  // tokens to look back for break points
-	chunkOverlap      = 135  // 15% of chunkTarget — overlap tokens between adjacent chunks
-	rrfK              = 60   // RRF fusion constant
-	maxRerank         = 30   // candidates sent to reranker
+	version       = "0.4.0"
+	defaultDB     = "index.sqlite"
+	chunkTarget   = 900 // target tokens per chunk
+	chunkLookback = 200 // tokens to look back for break points
+	chunkOverlap  = 135 // 15% of chunkTarget — overlap tokens between adjacent chunks
+
+	// chunkerVersion is folded into the embedding fingerprint. Bump it when
+	// ChunkDocument's output changes so existing vectors re-embed.
+	chunkerVersion    = "cv1"
+	rrfK              = 60      // RRF fusion constant
+	maxRerank         = 30      // candidates sent to reranker
 	maxIndexFileBytes = 1 << 20 // 1 MB file size limit for indexing
 
 	// BM25 tuning: target parameters (FTS5 hardcodes k1=1.2, b=0.75)
@@ -69,9 +75,9 @@ const (
 	// Strong-signal expansion bypass: skip the LLM ExpandQuery stage when BM25
 	// alone gives a clear winner. Scale-free since SearchBM25 and
 	// SearchBM25Normalized return scores on different scales.
-	strongSignalRatio   = 2.0 // top-1 must be at least this multiple of top-N
-	strongSignalRankN   = 3   // index used for the comparator (3 → top-1 vs top-3)
-	strongSignalProbeN  = 20  // candidates pulled by the probe BM25 call
+	strongSignalRatio  = 2.0 // top-1 must be at least this multiple of top-N
+	strongSignalRankN  = 3   // index used for the comparator (3 → top-1 vs top-3)
+	strongSignalProbeN = 20  // candidates pulled by the probe BM25 call
 )
 
 // skipDirs are directories that should never be traversed during indexing.
@@ -161,14 +167,23 @@ type ContextEntry struct {
 // ---------------------------------------------------------------------------
 
 type Document struct {
-	ID      int64
-	Path    string
-	Title   string
-	DocID   string // 6-char content hash
-	Hash    string // full content hash for change detection
-	Active  bool
-	Content string
-	Context string // inherited from collection/context tree
+	ID         int64
+	Path       string
+	Title      string
+	DocID      string // 6-char content hash
+	Hash       string // full content hash for change detection
+	Active     bool
+	Content    string
+	Context    string // inherited from collection/context tree
+	Collection string // owning collection name
+	AbsPath    string // on-disk filesystem path
+}
+
+// SkippedFile records a multi_get match that was not returned because its
+// on-disk size exceeded the maxBytes threshold.
+type SkippedFile struct {
+	Path string `json:"path"`
+	Size int64  `json:"size"`
 }
 
 type SearchResult struct {
@@ -201,7 +216,23 @@ func NewStore(dbPath string) (*Store, error) {
 	if err := os.MkdirAll(filepath.Dir(dbPath), 0o755); err != nil {
 		return nil, err
 	}
-	pool, err := sqlitex.NewPool(dbPath, sqlitex.PoolOptions{PoolSize: 4})
+	// WAL handles read/write concurrency but does not serialise concurrent
+	// writers — a scheduled sync racing the MCP daemon or an embed worker
+	// needs a generous busy timeout to queue instead of throwing
+	// SQLITE_BUSY. 0 restores fail-fast.
+	busyTimeout := 120 * time.Second
+	if v := os.Getenv("PICOQMD_SQLITE_BUSY_TIMEOUT"); v != "" {
+		if ms, err := strconv.Atoi(v); err == nil && ms >= 0 {
+			busyTimeout = time.Duration(ms) * time.Millisecond
+		}
+	}
+	pool, err := sqlitex.NewPool(dbPath, sqlitex.PoolOptions{
+		PoolSize: 4,
+		PrepareConn: func(conn *sqlite.Conn) error {
+			conn.SetBusyTimeout(busyTimeout)
+			return nil
+		},
+	})
 	if err != nil {
 		return nil, fmt.Errorf("open db: %w", err)
 	}
@@ -276,6 +307,17 @@ func (s *Store) migrate() error {
 	// Migration: add doc_len column for BM25 length normalization
 	// ALTER TABLE fails silently if column already exists — that's fine
 	sqlitex.Execute(conn, `ALTER TABLE documents ADD COLUMN doc_len INTEGER NOT NULL DEFAULT 0`, nil)
+
+	// Migration: add embedding fingerprint (model + chunker identity) so a
+	// model or chunker change marks existing vectors as pending instead of
+	// silently searching stale embeddings.
+	sqlitex.Execute(conn, `ALTER TABLE content_vectors ADD COLUMN fp TEXT NOT NULL DEFAULT ''`, nil)
+
+	// Legacy adoption: vectors written before fingerprinting are assumed to
+	// match the current model (picoqmd has only ever shipped one embed
+	// model). One-time no-op afterwards.
+	sqlitex.Execute(conn, `UPDATE content_vectors SET fp=? WHERE fp='' AND vec IS NOT NULL`,
+		&sqlitex.ExecOptions{Args: []any{embedFingerprint()}})
 
 	return nil
 }
@@ -447,12 +489,17 @@ func (s *Store) searchBM25(query, collection string, limit int) ([]SearchResult,
 	}
 
 	ftsQuery := toFTS5Query(query)
+	if ftsQuery == "" {
+		return nil, nil // nothing searchable (e.g. punctuation-only query)
+	}
 
 	// Column weights: title=5.0, content=1.0, docid=0.0
+	// No snippet() here: the FTS table is contentless (content=''), so FTS5
+	// cannot reconstruct text — snippets are extracted from disk below.
 	sql := `
 		SELECT d.docid, d.path, d.title,
 		       bm25(documents_fts, 5.0, 1.0, 0.0) AS score,
-		       snippet(documents_fts, 1, '>>>', '<<<', '...', 40) AS snip,
+		       c.path || '/' || d.path AS abs_path,
 		       c.context, d.doc_len, c.name AS col_name
 		FROM documents_fts f
 		JOIN documents d ON d.id = f.rowid
@@ -472,8 +519,9 @@ func (s *Store) searchBM25(query, collection string, limit int) ([]SearchResult,
 	args = append(args, limit)
 
 	type rawResult struct {
-		result SearchResult
-		docLen float64
+		result  SearchResult
+		docLen  float64
+		absPath string
 	}
 	var raw []rawResult
 
@@ -486,10 +534,10 @@ func (s *Store) searchBM25(query, collection string, limit int) ([]SearchResult,
 					Path:    stmt.ColumnText(1),
 					Title:   stmt.ColumnText(2),
 					Score:   -stmt.ColumnFloat(3), // bm25() returns negative scores
-					Snippet: stmt.ColumnText(4),
 					Context: stmt.ColumnText(5),
 				},
-				docLen: stmt.ColumnFloat(6),
+				absPath: stmt.ColumnText(4),
+				docLen:  stmt.ColumnFloat(6),
 			})
 			return nil
 		},
@@ -500,15 +548,43 @@ func (s *Store) searchBM25(query, collection string, limit int) ([]SearchResult,
 
 	// Apply post-FTS5 b-correction: adjust from default b=0.75 to target b=0.55
 	results := make([]SearchResult, len(raw))
+	absPaths := make([]string, len(raw))
 	for i, r := range raw {
 		results[i] = r.result
+		absPaths[i] = r.absPath
 		if r.docLen > 0 {
 			results[i].Score *= adjustBM25B(r.docLen, avgDocLen)
 		}
 	}
 
 	// Re-sort after correction (order may shift slightly)
-	sort.Slice(results, func(i, j int) bool { return results[i].Score > results[j].Score })
+	order := make([]int, len(results))
+	for i := range order {
+		order[i] = i
+	}
+	sort.Slice(order, func(i, j int) bool { return results[order[i]].Score > results[order[j]].Score })
+	sorted := make([]SearchResult, len(results))
+	sortedPaths := make([]string, len(results))
+	for i, idx := range order {
+		sorted[i] = results[idx]
+		sortedPaths[i] = absPaths[idx]
+	}
+	results, absPaths = sorted, sortedPaths
+
+	// Snippets from disk for the returned page. Bounded work: `limit` files,
+	// each already capped at maxIndexFileBytes during indexing.
+	terms := queryTerms(query)
+	for i := range results {
+		data, err := os.ReadFile(absPaths[i])
+		if err != nil {
+			continue // file moved since indexing; result is still valid
+		}
+		snip, windowStart := extractSnippet(string(data), terms, 200)
+		if snip != "" {
+			results[i].Snippet = snip
+			results[i].Line = bytes.Count(data[:windowStart], []byte("\n")) + 1
+		}
+	}
 
 	return results, nil
 }
@@ -793,23 +869,46 @@ func (s *Store) searchVector(query string, queryVec []float32, collection string
 }
 
 // GetDocument retrieves a single document by docid or path.
-func (s *Store) GetDocument(ref string) (*Document, error) {
+// parseRefRange splits a trailing :from or :from:count line-range suffix off
+// a get ref. Only called when the full ref fails to resolve, so paths that
+// happen to contain colons still work.
+func parseRefRange(ref string) (base string, from, count int) {
+	parts := strings.Split(ref, ":")
+	if len(parts) >= 3 {
+		if m, err1 := strconv.Atoi(parts[len(parts)-2]); err1 == nil {
+			if n, err2 := strconv.Atoi(parts[len(parts)-1]); err2 == nil {
+				return strings.Join(parts[:len(parts)-2], ":"), m, n
+			}
+		}
+	}
+	if len(parts) >= 2 {
+		if n, err := strconv.Atoi(parts[len(parts)-1]); err == nil {
+			return strings.Join(parts[:len(parts)-1], ":"), n, 0
+		}
+	}
+	return ref, 0, 0
+}
+
+// lookupDocument resolves a bare ref — #docid, collection-relative path, or
+// qmd://collection/path — to its metadata row. Content is not loaded.
+func (s *Store) lookupDocument(ref string) (*Document, error) {
 	conn, err := s.pool.Take(context.Background())
 	if err != nil {
 		return nil, err
 	}
 	defer s.pool.Put(conn)
 
+	ref = strings.TrimPrefix(ref, "qmd://")
 	ref = strings.TrimPrefix(ref, "#")
 	var doc Document
 	found := false
 
-	query := `SELECT d.id, d.path, d.title, d.docid, d.hash, c.context
+	query := `SELECT d.id, d.path, d.title, d.docid, d.hash, c.context, c.name, c.path || '/' || d.path
 	           FROM documents d JOIN collections c ON c.id = d.col_id
-	           WHERE (d.docid = ? OR d.path = ?) AND d.active = 1 LIMIT 1`
+	           WHERE (d.docid = ? OR d.path = ? OR c.name || '/' || d.path = ?) AND d.active = 1 LIMIT 1`
 
 	err = sqlitex.Execute(conn, query, &sqlitex.ExecOptions{
-		Args: []any{ref, ref},
+		Args: []any{ref, ref, ref},
 		ResultFunc: func(stmt *sqlite.Stmt) error {
 			found = true
 			doc.ID = stmt.ColumnInt64(0)
@@ -818,6 +917,8 @@ func (s *Store) GetDocument(ref string) (*Document, error) {
 			doc.DocID = stmt.ColumnText(3)
 			doc.Hash = stmt.ColumnText(4)
 			doc.Context = stmt.ColumnText(5)
+			doc.Collection = stmt.ColumnText(6)
+			doc.AbsPath = stmt.ColumnText(7)
 			return nil
 		},
 	})
@@ -830,15 +931,47 @@ func (s *Store) GetDocument(ref string) (*Document, error) {
 	return &doc, nil
 }
 
-// MultiGet retrieves documents matching a glob pattern or comma-separated list of paths.
-func (s *Store) MultiGet(pattern string) ([]Document, error) {
+// GetDocument resolves ref — path, #docid, or qmd://collection/path, each
+// optionally suffixed with :from or :from:count — and returns the document
+// with Content read from disk plus the requested line range (0 = unset).
+func (s *Store) GetDocument(ref string) (*Document, int, int, error) {
+	doc, err := s.lookupDocument(ref)
+	from, count := 0, 0
+	if err != nil {
+		base, f, c := parseRefRange(ref)
+		if base == ref {
+			return nil, 0, 0, err
+		}
+		doc, err = s.lookupDocument(base)
+		if err != nil {
+			return nil, 0, 0, err
+		}
+		from, count = f, c
+	}
+
+	data, err := os.ReadFile(doc.AbsPath)
+	if err != nil {
+		return nil, 0, 0, fmt.Errorf("document %s is indexed but unreadable at %s (moved or deleted?) — run 'picoqmd sync': %w",
+			doc.Path, doc.AbsPath, err)
+	}
+	doc.Content = string(data)
+	return doc, from, count, nil
+}
+
+// MultiGet retrieves documents matching a glob pattern or comma-separated
+// list of paths, with content read from disk. Files whose on-disk size
+// exceeds maxBytes (when > 0) are reported in the skipped list instead of
+// being silently dropped; files missing from disk are skipped with Size -1.
+func (s *Store) MultiGet(pattern string, maxBytes int64) ([]Document, []SkippedFile, error) {
 	conn, err := s.pool.Take(context.Background())
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	defer s.pool.Put(conn)
 
 	var docs []Document
+	var skipped []SkippedFile
+	seen := make(map[int64]bool)
 	patterns := strings.Split(pattern, ",")
 	for _, p := range patterns {
 		p = strings.TrimSpace(p)
@@ -846,34 +979,106 @@ func (s *Store) MultiGet(pattern string) ([]Document, error) {
 			continue
 		}
 		likePattern := strings.ReplaceAll(p, "*", "%")
+		var matches []Document
 		err = sqlitex.Execute(conn, `
-			SELECT d.id, d.path, d.title, d.docid, d.hash, c.context
+			SELECT d.id, d.path, d.title, d.docid, d.hash, c.context, c.name, c.path || '/' || d.path
 			FROM documents d JOIN collections c ON c.id = d.col_id
 			WHERE d.active = 1 AND d.path LIKE ?
 			ORDER BY d.path`, &sqlitex.ExecOptions{
 			Args: []any{likePattern},
 			ResultFunc: func(stmt *sqlite.Stmt) error {
-				docs = append(docs, Document{
-					ID:      stmt.ColumnInt64(0),
-					Path:    stmt.ColumnText(1),
-					Title:   stmt.ColumnText(2),
-					DocID:   stmt.ColumnText(3),
-					Hash:    stmt.ColumnText(4),
-					Context: stmt.ColumnText(5),
-					Active:  true,
+				matches = append(matches, Document{
+					ID:         stmt.ColumnInt64(0),
+					Path:       stmt.ColumnText(1),
+					Title:      stmt.ColumnText(2),
+					DocID:      stmt.ColumnText(3),
+					Hash:       stmt.ColumnText(4),
+					Context:    stmt.ColumnText(5),
+					Collection: stmt.ColumnText(6),
+					AbsPath:    stmt.ColumnText(7),
+					Active:     true,
 				})
 				return nil
 			},
 		})
 		if err != nil {
-			return nil, err
+			return nil, nil, err
+		}
+		for _, doc := range matches {
+			if seen[doc.ID] {
+				continue
+			}
+			seen[doc.ID] = true
+			fi, statErr := os.Stat(doc.AbsPath)
+			if statErr != nil {
+				skipped = append(skipped, SkippedFile{Path: doc.Path, Size: -1})
+				continue
+			}
+			if maxBytes > 0 && fi.Size() > maxBytes {
+				skipped = append(skipped, SkippedFile{Path: doc.Path, Size: fi.Size()})
+				continue
+			}
+			data, readErr := os.ReadFile(doc.AbsPath)
+			if readErr != nil {
+				skipped = append(skipped, SkippedFile{Path: doc.Path, Size: -1})
+				continue
+			}
+			doc.Content = string(data)
+			docs = append(docs, doc)
 		}
 	}
-	return docs, nil
+	return docs, skipped, nil
 }
 
-// UnembeddedHashes returns content hashes that haven't been embedded yet.
-func (s *Store) UnembeddedHashes() ([]string, error) {
+// renderDocument formats a document for display: a header with the qmd://
+// URI (or on-disk path when fullPath), docid, and line range, followed by
+// optionally line-numbered content. from/count of 0 mean start/whole file.
+func renderDocument(doc *Document, from, count int, lineNumbers, fullPath bool) string {
+	content := strings.TrimSuffix(doc.Content, "\n")
+	lines := strings.Split(content, "\n")
+	total := len(lines)
+	if from < 1 {
+		from = 1
+	}
+	if from > total {
+		from = total
+	}
+	end := total
+	if count > 0 && from-1+count < total {
+		end = from - 1 + count
+	}
+	id := "qmd://" + doc.Collection + "/" + doc.Path
+	if fullPath {
+		id = doc.AbsPath
+	}
+	var b strings.Builder
+	fmt.Fprintf(&b, "%s #%s (lines %d-%d of %d)\n", id, doc.DocID, from, end, total)
+	for i := from; i <= end; i++ {
+		if lineNumbers {
+			fmt.Fprintf(&b, "%d→%s\n", i, lines[i-1])
+		} else {
+			b.WriteString(lines[i-1])
+			b.WriteByte('\n')
+		}
+	}
+	return b.String()
+}
+
+// pendingHashCond selects active documents whose embeddings are incomplete:
+// never chunked, any chunk still missing its vector, or any chunk embedded
+// under a different model/chunker fingerprint. A document only counts as
+// embedded when every chunk has a current vector — partial coverage from an
+// interrupted run stays pending and resumes on the next embed.
+const pendingHashCond = `
+	d.active = 1
+	AND (
+		NOT EXISTS (SELECT 1 FROM content_vectors v WHERE v.hash = d.hash)
+		OR EXISTS (SELECT 1 FROM content_vectors v WHERE v.hash = d.hash AND (v.vec IS NULL OR v.fp <> ?))
+	)`
+
+// UnembeddedHashes returns content hashes whose embeddings are missing,
+// incomplete, or stale relative to the given fingerprint.
+func (s *Store) UnembeddedHashes(fp string) ([]string, error) {
 	conn, err := s.pool.Take(context.Background())
 	if err != nil {
 		return nil, err
@@ -881,21 +1086,21 @@ func (s *Store) UnembeddedHashes() ([]string, error) {
 	defer s.pool.Put(conn)
 
 	var hashes []string
-	err = sqlitex.Execute(conn, `
-		SELECT DISTINCT d.hash FROM documents d
-		WHERE d.active = 1
-		  AND d.hash NOT IN (SELECT DISTINCT hash FROM content_vectors WHERE vec IS NOT NULL)
-	`, &sqlitex.ExecOptions{
-		ResultFunc: func(stmt *sqlite.Stmt) error {
-			hashes = append(hashes, stmt.ColumnText(0))
-			return nil
-		},
-	})
+	err = sqlitex.Execute(conn,
+		`SELECT DISTINCT d.hash FROM documents d WHERE `+pendingHashCond,
+		&sqlitex.ExecOptions{
+			Args: []any{fp},
+			ResultFunc: func(stmt *sqlite.Stmt) error {
+				hashes = append(hashes, stmt.ColumnText(0))
+				return nil
+			},
+		})
 	return hashes, err
 }
 
-// CountUnembedded returns the number of active documents without embeddings.
-func (s *Store) CountUnembedded() (int, error) {
+// CountUnembedded returns the number of active documents whose embeddings
+// are missing, incomplete, or stale relative to the given fingerprint.
+func (s *Store) CountUnembedded(fp string) (int, error) {
 	conn, err := s.pool.Take(context.Background())
 	if err != nil {
 		return 0, err
@@ -903,16 +1108,15 @@ func (s *Store) CountUnembedded() (int, error) {
 	defer s.pool.Put(conn)
 
 	var count int
-	err = sqlitex.Execute(conn, `
-		SELECT COUNT(DISTINCT d.hash) FROM documents d
-		WHERE d.active = 1
-		  AND d.hash NOT IN (SELECT DISTINCT hash FROM content_vectors WHERE vec IS NOT NULL)
-	`, &sqlitex.ExecOptions{
-		ResultFunc: func(stmt *sqlite.Stmt) error {
-			count = stmt.ColumnInt(0)
-			return nil
-		},
-	})
+	err = sqlitex.Execute(conn,
+		`SELECT COUNT(DISTINCT d.hash) FROM documents d WHERE `+pendingHashCond,
+		&sqlitex.ExecOptions{
+			Args: []any{fp},
+			ResultFunc: func(stmt *sqlite.Stmt) error {
+				count = stmt.ColumnInt(0)
+				return nil
+			},
+		})
 	return count, err
 }
 
@@ -925,27 +1129,36 @@ func (s *Store) SkipNextUnembedded() error {
 	}
 	defer s.pool.Put(conn)
 
+	fp := embedFingerprint()
 	var hash string
-	err = sqlitex.Execute(conn, `
-		SELECT DISTINCT d.hash FROM documents d
-		WHERE d.active = 1
-		  AND d.hash NOT IN (SELECT DISTINCT hash FROM content_vectors WHERE vec IS NOT NULL)
-		LIMIT 1
-	`, &sqlitex.ExecOptions{
-		ResultFunc: func(stmt *sqlite.Stmt) error {
-			hash = stmt.ColumnText(0)
-			return nil
-		},
-	})
+	err = sqlitex.Execute(conn,
+		`SELECT DISTINCT d.hash FROM documents d WHERE `+pendingHashCond+` LIMIT 1`,
+		&sqlitex.ExecOptions{
+			Args: []any{fp},
+			ResultFunc: func(stmt *sqlite.Stmt) error {
+				hash = stmt.ColumnText(0)
+				return nil
+			},
+		})
 	if err != nil || hash == "" {
 		return err
 	}
 
+	// Cover both pending shapes: a document with no chunks at all gets a
+	// dummy row, and any chunks with missing/stale vectors are stamped so
+	// the document stops matching pendingHashCond and the loop progresses.
 	dummyVec := make([]byte, 4)
-	return sqlitex.Execute(conn, `
-		INSERT OR IGNORE INTO content_vectors (hash, seq, pos, text, vec) VALUES (?, 0, 0, '[skipped]', ?)
+	if err := sqlitex.Execute(conn, `
+		INSERT OR IGNORE INTO content_vectors (hash, seq, pos, text, vec, fp) VALUES (?, 0, 0, '[skipped]', ?, ?)
 	`, &sqlitex.ExecOptions{
-		Args: []any{hash, dummyVec},
+		Args: []any{hash, dummyVec, fp},
+	}); err != nil {
+		return err
+	}
+	return sqlitex.Execute(conn, `
+		UPDATE content_vectors SET vec = COALESCE(vec, ?), fp = ? WHERE hash = ? AND (vec IS NULL OR fp <> ?)
+	`, &sqlitex.ExecOptions{
+		Args: []any{dummyVec, fp, hash, fp},
 	})
 }
 
@@ -974,8 +1187,9 @@ func (s *Store) StoreChunks(hash string, chunks []Chunk) error {
 	return nil
 }
 
-// StoreVector writes the embedding vector for a chunk.
-func (s *Store) StoreVector(hash string, seq int, vec []float32) error {
+// StoreVector writes the embedding vector for a chunk, stamped with the
+// fingerprint of the model/chunker that produced it.
+func (s *Store) StoreVector(hash string, seq int, vec []float32, fp string) error {
 	conn, err := s.pool.Take(context.Background())
 	if err != nil {
 		return err
@@ -983,8 +1197,31 @@ func (s *Store) StoreVector(hash string, seq int, vec []float32) error {
 	defer s.pool.Put(conn)
 
 	return sqlitex.Execute(conn,
-		`UPDATE content_vectors SET vec=? WHERE hash=? AND seq=?`,
-		&sqlitex.ExecOptions{Args: []any{float32ToBytes(vec), hash, seq}})
+		`UPDATE content_vectors SET vec=?, fp=? WHERE hash=? AND seq=?`,
+		&sqlitex.ExecOptions{Args: []any{float32ToBytes(vec), fp, hash, seq}})
+}
+
+// HasStaleFP reports whether any embedded chunk of a hash carries a
+// fingerprint other than fp — meaning the model or chunker changed and the
+// document must be re-chunked and re-embedded from scratch.
+func (s *Store) HasStaleFP(hash, fp string) (bool, error) {
+	conn, err := s.pool.Take(context.Background())
+	if err != nil {
+		return false, err
+	}
+	defer s.pool.Put(conn)
+
+	var stale bool
+	err = sqlitex.Execute(conn,
+		`SELECT 1 FROM content_vectors WHERE hash = ? AND vec IS NOT NULL AND fp <> ? LIMIT 1`,
+		&sqlitex.ExecOptions{
+			Args: []any{hash, fp},
+			ResultFunc: func(stmt *sqlite.Stmt) error {
+				stale = true
+				return nil
+			},
+		})
+	return stale, err
 }
 
 // Stats returns index statistics.
@@ -1051,20 +1288,29 @@ func (s *Store) HasChunks(hash string) (bool, error) {
 }
 
 // UnembeddedChunks returns chunk seq + text for a hash where vec IS NULL.
-func (s *Store) UnembeddedChunks(hash string) ([]struct{ Seq int; Text string }, error) {
+func (s *Store) UnembeddedChunks(hash string) ([]struct {
+	Seq  int
+	Text string
+}, error) {
 	conn, err := s.pool.Take(context.Background())
 	if err != nil {
 		return nil, err
 	}
 	defer s.pool.Put(conn)
 
-	var chunks []struct{ Seq int; Text string }
+	var chunks []struct {
+		Seq  int
+		Text string
+	}
 	err = sqlitex.Execute(conn,
-		`SELECT seq, text FROM content_vectors WHERE hash = ? AND vec IS NULL ORDER BY seq`,
+		`SELECT seq, text FROM content_vectors WHERE hash = ? AND (vec IS NULL OR fp <> ?) ORDER BY seq`,
 		&sqlitex.ExecOptions{
-			Args: []any{hash},
+			Args: []any{hash, embedFingerprint()},
 			ResultFunc: func(stmt *sqlite.Stmt) error {
-				chunks = append(chunks, struct{ Seq int; Text string }{
+				chunks = append(chunks, struct {
+					Seq  int
+					Text string
+				}{
 					Seq: stmt.ColumnInt(0), Text: stmt.ColumnText(1),
 				})
 				return nil
@@ -1459,6 +1705,7 @@ func (m *MCPServer) toolDefinitions() []map[string]any {
 				"maxChars":   map[string]any{"type": "integer", "description": "Truncate total response to this many characters (server-side token budget)"},
 				"note":       map[string]any{"type": "string", "description": "Save an observation linked to the top result (persisted across sessions, auto-flagged stale when source changes)"},
 				"noExpand":   map[string]any{"type": "boolean", "description": "Skip the LLM query-expansion stage even if the strong-signal probe would otherwise run it. Useful for benchmarking."},
+				"noRerank":   map[string]any{"type": "boolean", "description": "Skip the LLM reranking stage and return RRF-fused order directly. Faster on constrained hardware."},
 			}, "required": []string{"query"}}})
 		tools = append(tools, map[string]any{
 			"name": "research", "description": "Composite search: runs BM25 + vector in parallel, deduplicates by docid via RRF, and merges within a token budget. One call instead of two.",
@@ -1474,17 +1721,22 @@ func (m *MCPServer) toolDefinitions() []map[string]any {
 	}
 
 	tools = append(tools,
-		map[string]any{"name": "get", "description": "Retrieve a single document by path or docid (#abc123). Supports line offset (file.md:100).",
+		map[string]any{"name": "get", "description": "Retrieve a single document by path or docid (#abc123). Supports line-range suffixes: file.md:120 (from line 120) and file.md:120:40 (40 lines from line 120). Output is line-numbered with a qmd:// + #docid header.",
 			"inputSchema": map[string]any{"type": "object", "properties": map[string]any{
-				"ref":      map[string]any{"type": "string", "description": "File path, docid (#abc123), or path:line"},
-				"maxLines": map[string]any{"type": "integer", "description": "Maximum lines to return"},
-				"maxChars": map[string]any{"type": "integer", "description": "Truncate response to this many characters"},
+				"ref":         map[string]any{"type": "string", "description": "File path, docid (#abc123), or qmd:// URI — optionally with :from or :from:count line-range suffix"},
+				"fromLine":    map[string]any{"type": "integer", "description": "1-based first line to return (overrides ref suffix)"},
+				"maxLines":    map[string]any{"type": "integer", "description": "Maximum lines to return"},
+				"lineNumbers": map[string]any{"type": "boolean", "description": "Prefix each line with its line number (default true)"},
+				"fullPath":    map[string]any{"type": "boolean", "description": "Use the on-disk filesystem path in the header instead of the qmd:// URI (handy for piping into file tools)"},
+				"maxChars":    map[string]any{"type": "integer", "description": "Truncate response to this many characters"},
 			}, "required": []string{"ref"}}},
-		map[string]any{"name": "multi_get", "description": "Retrieve multiple documents by glob pattern or comma-separated list",
+		map[string]any{"name": "multi_get", "description": "Retrieve multiple documents by glob pattern or comma-separated list. Line-numbered output; oversized or unreadable files are reported as skipped rather than silently dropped.",
 			"inputSchema": map[string]any{"type": "object", "properties": map[string]any{
-				"pattern":  map[string]any{"type": "string", "description": "Glob pattern (e.g., docs/*.md) or comma-separated paths"},
-				"maxBytes": map[string]any{"type": "integer", "description": "Skip files over this size (default 10240)"},
-				"maxChars": map[string]any{"type": "integer", "description": "Truncate total response to this many characters"},
+				"pattern":     map[string]any{"type": "string", "description": "Glob pattern (e.g., docs/*.md) or comma-separated paths"},
+				"maxBytes":    map[string]any{"type": "integer", "description": "Skip files over this size in bytes (default 65536)"},
+				"lineNumbers": map[string]any{"type": "boolean", "description": "Prefix each line with its line number (default true)"},
+				"fullPath":    map[string]any{"type": "boolean", "description": "Use on-disk filesystem paths in headers instead of qmd:// URIs"},
+				"maxChars":    map[string]any{"type": "integer", "description": "Truncate total response to this many characters"},
 			}, "required": []string{"pattern"}}},
 		map[string]any{"name": "status", "description": "Index health: collection inventory, document counts, embedding status",
 			"inputSchema": map[string]any{"type": "object", "properties": map[string]any{}}},
@@ -1503,18 +1755,22 @@ func (m *MCPServer) callTool(params json.RawMessage) (any, error) {
 	}
 
 	var args struct {
-		Query      string  `json:"query"`
-		Intent     string  `json:"intent"`
-		Ref        string  `json:"ref"`
-		Pattern    string  `json:"pattern"`
-		Limit      int     `json:"limit"`
-		Collection string  `json:"collection"`
-		MinScore   float64 `json:"minScore"`
-		MaxBytes   int     `json:"maxBytes"`
-		MaxLines   int     `json:"maxLines"`
-		MaxChars   int     `json:"maxChars"`
-		Note       string  `json:"note"`
-		NoExpand   bool    `json:"noExpand"`
+		Query       string  `json:"query"`
+		Intent      string  `json:"intent"`
+		Ref         string  `json:"ref"`
+		Pattern     string  `json:"pattern"`
+		Limit       int     `json:"limit"`
+		Collection  string  `json:"collection"`
+		MinScore    float64 `json:"minScore"`
+		MaxBytes    int64   `json:"maxBytes"`
+		MaxLines    int     `json:"maxLines"`
+		MaxChars    int     `json:"maxChars"`
+		Note        string  `json:"note"`
+		NoExpand    bool    `json:"noExpand"`
+		NoRerank    bool    `json:"noRerank"`
+		FromLine    int     `json:"fromLine"`
+		LineNumbers *bool   `json:"lineNumbers"`
+		FullPath    bool    `json:"fullPath"`
 	}
 	if err := json.Unmarshal(call.Arguments, &args); err != nil {
 		return nil, fmt.Errorf("invalid tool arguments: %w", err)
@@ -1523,8 +1779,9 @@ func (m *MCPServer) callTool(params json.RawMessage) (any, error) {
 		args.Limit = 10
 	}
 	if args.MaxBytes == 0 {
-		args.MaxBytes = 10240
+		args.MaxBytes = 65536
 	}
+	lineNumbers := args.LineNumbers == nil || *args.LineNumbers
 
 	filterMinScore := func(results []SearchResult, minScore float64) []SearchResult {
 		if minScore <= 0 {
@@ -1615,6 +1872,9 @@ func (m *MCPServer) callTool(params json.RawMessage) (any, error) {
 		if t, ok := m.hybrid.(interface{ SetNoExpand(bool) }); ok {
 			t.SetNoExpand(args.NoExpand)
 		}
+		if t, ok := m.hybrid.(interface{ SetNoRerank(bool) }); ok {
+			t.SetNoRerank(args.NoRerank)
+		}
 		results, err := m.hybrid.Search(context.Background(), args.Query, args.Intent, args.Collection, args.Limit)
 		if err != nil {
 			return nil, err
@@ -1659,29 +1919,53 @@ func (m *MCPServer) callTool(params json.RawMessage) (any, error) {
 		return applyMaxChars(toolResult(filtered), args.MaxChars), nil
 
 	case "get":
-		doc, err := m.store.GetDocument(args.Ref)
+		doc, from, count, err := m.store.GetDocument(args.Ref)
 		if err != nil {
 			return nil, err
 		}
-		return applyMaxChars(toolResult(doc), args.MaxChars), nil
+		if args.FromLine > 0 {
+			from = args.FromLine // explicit param overrides ref suffix
+		}
+		if args.MaxLines > 0 && count == 0 {
+			count = args.MaxLines
+		}
+		return applyMaxChars(textResult(renderDocument(doc, from, count, lineNumbers, args.FullPath)), args.MaxChars), nil
 
 	case "multi_get":
-		docs, err := m.store.MultiGet(args.Pattern)
+		docs, skipped, err := m.store.MultiGet(args.Pattern, args.MaxBytes)
 		if err != nil {
 			return nil, err
 		}
-		return applyMaxChars(toolResult(docs), args.MaxChars), nil
+		var b strings.Builder
+		for i := range docs {
+			if i > 0 {
+				b.WriteString("\n")
+			}
+			b.WriteString(renderDocument(&docs[i], 0, 0, lineNumbers, args.FullPath))
+		}
+		for _, sk := range skipped {
+			if sk.Size < 0 {
+				fmt.Fprintf(&b, "\n[skipped %s: unreadable on disk — run 'picoqmd sync']", sk.Path)
+			} else {
+				fmt.Fprintf(&b, "\n[skipped %s: %d bytes > maxBytes %d]", sk.Path, sk.Size, args.MaxBytes)
+			}
+		}
+		if len(docs) == 0 && len(skipped) == 0 {
+			b.WriteString("no documents match: " + args.Pattern)
+		}
+		return applyMaxChars(textResult(b.String()), args.MaxChars), nil
 
 	case "status":
 		cols, docs, chunks, _ := m.store.Stats()
-		unembedded, _ := m.store.UnembeddedHashes()
+		pending, _ := m.store.CountUnembedded(embedFingerprint())
 		stale := getStaleObservations(m.observationsPath(), m.store)
 		return toolResult(map[string]any{
 			"collections":       cols,
 			"documents":         docs,
 			"chunks":            chunks,
-			"needsEmbedding":    len(unembedded),
-			"hasVectorIndex":    len(unembedded) == 0 && chunks > 0,
+			"needsEmbedding":    pending,
+			"hasVectorIndex":    pending == 0 && chunks > 0,
+			"fingerprint":       embedFingerprint(),
 			"staleObservations": len(stale),
 		}), nil
 
@@ -1703,7 +1987,6 @@ type Observation struct {
 	Stale     bool   `json:"stale,omitempty"`
 }
 
-
 func (m *MCPServer) observationsPath() string {
 	dir := os.Getenv("XDG_CONFIG_HOME")
 	if dir == "" {
@@ -1714,7 +1997,7 @@ func (m *MCPServer) observationsPath() string {
 }
 
 func (m *MCPServer) getDocHash(docid string) string {
-	doc, err := m.store.GetDocument(docid)
+	doc, err := m.store.lookupDocument(docid)
 	if err != nil {
 		return ""
 	}
@@ -1754,7 +2037,7 @@ func getStaleObservations(path string, store *Store) []Observation {
 	}
 	var stale []Observation
 	for _, obs := range observations {
-		doc, err := store.GetDocument(obs.DocID)
+		doc, err := store.lookupDocument(obs.DocID)
 		if err != nil {
 			// Document deleted — observation is stale
 			obs.Stale = true
@@ -1771,9 +2054,15 @@ func getStaleObservations(path string, store *Store) []Observation {
 
 func toolResult(data any) map[string]any {
 	b, _ := json.Marshal(data)
+	return textResult(string(b))
+}
+
+// textResult wraps already-formatted text as an MCP tool result without
+// JSON-encoding it a second time.
+func textResult(text string) map[string]any {
 	return map[string]any{
 		"content": []map[string]any{
-			{"type": "text", "text": string(b)},
+			{"type": "text", "text": text},
 		},
 	}
 }
@@ -2019,6 +2308,14 @@ func dbPath(indexName string) string {
 // Utilities
 // ---------------------------------------------------------------------------
 
+// embedFingerprint identifies the embedding model + chunker that produced a
+// vector. Vectors whose stored fingerprint differs are treated as pending so
+// a model or chunker change triggers re-embedding instead of silently
+// searching stale embeddings.
+func embedFingerprint() string {
+	return defaultModels[0].Filename + "|" + chunkerVersion
+}
+
 func contentHash(content string) string {
 	h := sha256.Sum256([]byte(content))
 	return hex.EncodeToString(h[:])
@@ -2074,7 +2371,10 @@ func queryTerms(query string) []string {
 // >>>...<<< (matching the FTS5 BM25 snippet format already used elsewhere).
 // If no terms are found, returns the head of the text. Returns the snippet and
 // the byte offset where the window starts within `text`.
-func extractSnippet(text string, terms []string, windowChars int) (snippet string, windowStart int) {
+// extractSnippet returns a highlighted window around the first term hit plus
+// citePos, the byte offset of that hit (window start when no term matches) —
+// suitable for line-number citations.
+func extractSnippet(text string, terms []string, windowChars int) (snippet string, citePos int) {
 	if len(text) == 0 || windowChars <= 0 {
 		return "", 0
 	}
@@ -2142,7 +2442,7 @@ func extractSnippet(text string, terms []string, windowChars int) (snippet strin
 	if end < len(text) {
 		window = window + "..."
 	}
-	return window, start
+	return window, firstHit
 }
 
 func isSnippetBoundary(b byte) bool {
@@ -2199,15 +2499,51 @@ func computeLineNumber(absPath string, pos int) int {
 	return bytes.Count(buf[:n], []byte("\n")) + 1
 }
 
+// ftsString renders a term as a double-quoted FTS5 string with embedded
+// quotes doubled. Inside a string the tokenizer treats punctuation as plain
+// separators, so "2026.4.10" becomes the phrase (2026 4 10), "real-time"
+// becomes (real time), and operator words like AND lose their meaning.
+// Returns "" for terms that contain no letters or digits (an empty phrase is
+// an FTS5 syntax error).
+func ftsString(term string) string {
+	hasToken := false
+	for _, r := range term {
+		if unicode.IsLetter(r) || unicode.IsDigit(r) {
+			hasToken = true
+			break
+		}
+	}
+	if !hasToken {
+		return ""
+	}
+	return `"` + strings.ReplaceAll(term, `"`, `""`) + `"`
+}
+
+// toFTS5Query converts a free-text query into FTS5 MATCH syntax that can
+// never produce a syntax error: every term is emitted as a quoted string
+// (see ftsString), with a trailing * on unquoted terms for prefix matching.
+// User-quoted phrases are preserved without the prefix star. Returns "" when
+// nothing searchable remains — callers must skip the MATCH entirely.
 func toFTS5Query(query string) string {
 	words := strings.Fields(query)
-	if len(words) == 0 {
-		return query
-	}
 
 	var parts []string
 	inPhrase := false
 	var phrase []string
+
+	appendTerm := func(w string, prefix bool) {
+		if q := ftsString(strings.Trim(w, `"'`)); q != "" {
+			if prefix {
+				q += "*"
+			}
+			parts = append(parts, q)
+		}
+	}
+	appendPhrase := func(ws []string) {
+		if q := ftsString(strings.Join(ws, " ")); q != "" {
+			parts = append(parts, q)
+		}
+	}
 
 	for _, w := range words {
 		if !inPhrase && strings.HasPrefix(w, `"`) {
@@ -2217,31 +2553,28 @@ func toFTS5Query(query string) string {
 				// Single-word quoted: "word"
 				inPhrase = false
 				phrase[0] = strings.TrimSuffix(phrase[0], `"`)
-				parts = append(parts, `"`+strings.Join(phrase, " ")+`"`)
+				appendPhrase(phrase)
 			}
 			continue
 		}
 		if inPhrase {
 			if strings.HasSuffix(w, `"`) {
 				phrase = append(phrase, strings.TrimSuffix(w, `"`))
-				parts = append(parts, `"`+strings.Join(phrase, " ")+`"`)
+				appendPhrase(phrase)
 				inPhrase = false
 			} else {
 				phrase = append(phrase, w)
 			}
 			continue
 		}
-		// Unquoted word — use prefix matching
-		w = strings.Trim(w, `"'`)
-		if w != "" {
-			parts = append(parts, w+"*")
-		}
+		// Unquoted word — quoted string with prefix matching
+		appendTerm(w, true)
 	}
 
 	// Unclosed quote — treat remaining words as prefix terms
 	if inPhrase {
 		for _, w := range phrase {
-			parts = append(parts, w+"*")
+			appendTerm(w, true)
 		}
 	}
 
@@ -2372,6 +2705,7 @@ func main() {
 	var searchFormat string
 	var remoteAddr string
 	var noExpand bool
+	var noRerank bool
 	var searchIntent string
 
 	// --- smartSearch dispatches to the best available pipeline ---
@@ -2385,6 +2719,9 @@ func main() {
 			hybrid := newHybridSearcher(store, engine)
 			if t, ok := hybrid.(interface{ SetNoExpand(bool) }); ok {
 				t.SetNoExpand(noExpand)
+			}
+			if t, ok := hybrid.(interface{ SetNoRerank(bool) }); ok {
+				t.SetNoRerank(noRerank)
 			}
 			results, err := hybrid.Search(context.Background(), query, intent, "", limit)
 			if err != nil {
@@ -2456,6 +2793,7 @@ Quick start:
 	root.PersistentFlags().BoolVar(&quiet, "quiet", quiet, "suppress per-document progress output (auto-enabled when stdout is not a terminal)")
 	root.PersistentFlags().BoolVar(new(bool), "verbose", false, "force progress output even when stdout is not a terminal")
 	root.PersistentFlags().BoolVar(&noExpand, "no-expand", false, "skip the LLM query-expansion stage (forces strong-signal-only behavior)")
+	root.PersistentFlags().BoolVar(&noRerank, "no-rerank", false, "skip the LLM reranking stage (RRF-fused order, faster on constrained hardware)")
 	root.PersistentFlags().StringVar(&searchIntent, "intent", "", "optional disambiguation hint passed to expansion, reranking, and snippet selection")
 	// --verbose overrides the auto-quiet behavior. We can't share a single
 	// bool with --quiet (cobra rejects that), so we fix it up after parse:
@@ -2696,6 +3034,9 @@ Quick start:
 			if t, ok := hybrid.(interface{ SetNoExpand(bool) }); ok {
 				t.SetNoExpand(noExpand)
 			}
+			if t, ok := hybrid.(interface{ SetNoRerank(bool) }); ok {
+				t.SetNoRerank(noRerank)
+			}
 			results, err := hybrid.Search(context.Background(), query, searchIntent, "", limit)
 			if err != nil {
 				return err
@@ -2709,7 +3050,7 @@ Quick start:
 	// --- get ---
 	getCmd := &cobra.Command{
 		Use:   "get <ref>",
-		Short: "Retrieve document by docid (#abc123) or path",
+		Short: "Retrieve document by docid (#abc123) or path, with optional :from:count line-range suffix",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			store, err := NewStore(dbPath(indexName))
@@ -2718,15 +3059,31 @@ Quick start:
 			}
 			defer store.Close()
 
-			doc, err := store.GetDocument(args[0])
+			doc, from, count, err := store.GetDocument(args[0])
 			if err != nil {
 				return err
 			}
-			b, _ := json.MarshalIndent(doc, "", "  ")
-			fmt.Println(string(b))
+			if f, _ := cmd.Flags().GetInt("from"); f > 0 {
+				from = f
+			}
+			if l, _ := cmd.Flags().GetInt("lines"); l > 0 {
+				count = l
+			}
+			if searchFormat == "json" {
+				b, _ := json.MarshalIndent(doc, "", "  ")
+				fmt.Println(string(b))
+				return nil
+			}
+			noNums, _ := cmd.Flags().GetBool("no-line-numbers")
+			fullPath, _ := cmd.Flags().GetBool("full-path")
+			fmt.Print(renderDocument(doc, from, count, !noNums, fullPath))
 			return nil
 		},
 	}
+	getCmd.Flags().Int("from", 0, "1-based first line to print (overrides ref suffix)")
+	getCmd.Flags().Int("lines", 0, "number of lines to print")
+	getCmd.Flags().Bool("no-line-numbers", false, "omit line-number prefixes")
+	getCmd.Flags().Bool("full-path", false, "print the on-disk path in the header instead of the qmd:// URI")
 
 	// --- status ---
 	statusCmd := &cobra.Command{
@@ -2740,8 +3097,9 @@ Quick start:
 			defer store.Close()
 
 			cols, docs, chunks, _ := store.Stats()
-			fmt.Printf("collections: %d\ndocuments:   %d\nchunks:      %d\ndatabase:    %s\n",
-				cols, docs, chunks, dbPath(indexName))
+			pending, _ := store.CountUnembedded(embedFingerprint())
+			fmt.Printf("collections: %d\ndocuments:   %d\nchunks:      %d\npending:     %d docs need (re-)embedding\nfingerprint: %s\ndatabase:    %s\n",
+				cols, docs, chunks, pending, embedFingerprint(), dbPath(indexName))
 			return nil
 		},
 	}

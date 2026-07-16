@@ -497,9 +497,10 @@ func (e *LLMEngine) Rerank(query, intent string, candidates []string) ([]float64
 // ---------------------------------------------------------------------------
 
 type HybridSearcher struct {
-	store     *Store
-	engine    Embedder
-	noExpand  bool // force-disable ExpandQuery (CLI/MCP override for benchmarking)
+	store    *Store
+	engine   Embedder
+	noExpand bool // force-disable ExpandQuery (CLI/MCP override for benchmarking)
+	noRerank bool // force-disable Rerank (constrained hardware / benchmarking)
 }
 
 func newHybridSearcher(store *Store, engine Embedder) Searcher {
@@ -509,6 +510,10 @@ func newHybridSearcher(store *Store, engine Embedder) Searcher {
 // SetNoExpand forces the LLM ExpandQuery stage off regardless of strong-signal
 // detection. Mainly used for benchmarking and the --no-expand CLI flag.
 func (h *HybridSearcher) SetNoExpand(v bool) { h.noExpand = v }
+
+// SetNoRerank skips the LLM reranking stage and returns RRF-fused order
+// directly. Useful on constrained hardware and for benchmarking.
+func (h *HybridSearcher) SetNoRerank(v bool) { h.noRerank = v }
 
 // hasStrongSignal returns true when the top BM25 result dominates the rest by
 // at least strongSignalRatio× the score at strongSignalRankN. Scale-free, so
@@ -672,7 +677,13 @@ func (h *HybridSearcher) Search(ctx context.Context, query, intent, collection s
 		candidateTexts = append(candidateTexts, doc.Title+" "+doc.Snippet)
 	}
 
-	rerankScores, err := h.engine.Rerank(query, intent, candidateTexts)
+	var rerankScores []float64
+	var err error
+	if h.noRerank {
+		err = fmt.Errorf("rerank disabled")
+	} else {
+		rerankScores, err = h.engine.Rerank(query, intent, candidateTexts)
+	}
 	if err != nil {
 		var results []SearchResult
 		for _, entry := range rrfRanked {
@@ -910,7 +921,8 @@ func extractLibsFromTarGz(tgzPath, destDir string) error {
 // ---------------------------------------------------------------------------
 
 func embedAll(store *Store) error {
-	total, err := store.CountUnembedded()
+	fp := embedFingerprint()
+	total, err := store.CountUnembedded(fp)
 	if err != nil {
 		return err
 	}
@@ -939,7 +951,7 @@ func embedAll(store *Store) error {
 
 	const batchSize = 500
 	for {
-		remaining, err := store.CountUnembedded()
+		remaining, err := store.CountUnembedded(fp)
 		if err != nil {
 			return err
 		}
@@ -957,7 +969,7 @@ func embedAll(store *Store) error {
 		cmd.Env = os.Environ()
 
 		err = cmd.Run()
-		newRemaining, countErr := store.CountUnembedded()
+		newRemaining, countErr := store.CountUnembedded(fp)
 		if countErr != nil {
 			return countErr
 		}
@@ -1000,7 +1012,8 @@ func embedWorker(maxDocs int) error {
 	engine := NewLLMEngine(cacheDir())
 	defer engine.Close()
 
-	hashes, err := store.UnembeddedHashes()
+	fp := embedFingerprint()
+	hashes, err := store.UnembeddedHashes(fp)
 	if err != nil {
 		return err
 	}
@@ -1022,6 +1035,18 @@ func embedWorker(maxDocs int) error {
 		hasChunks, err := store.HasChunks(hash)
 		if err != nil {
 			return err
+		}
+		// A stale fingerprint means the model or chunker changed — existing
+		// chunks may be cut differently now, so re-chunk from scratch
+		// (StoreChunks deletes the old rows) and re-embed everything.
+		if hasChunks {
+			stale, err := store.HasStaleFP(hash, fp)
+			if err != nil {
+				return err
+			}
+			if stale {
+				hasChunks = false
+			}
 		}
 		if !hasChunks {
 			data, err := os.ReadFile(absPath)
@@ -1049,7 +1074,7 @@ func embedWorker(maxDocs int) error {
 				embedErrors++
 				continue
 			}
-			if err := store.StoreVector(hash, chunk.Seq, vec); err != nil {
+			if err := store.StoreVector(hash, chunk.Seq, vec, fp); err != nil {
 				return err
 			}
 		}

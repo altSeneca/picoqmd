@@ -1,5 +1,77 @@
 # Changelog
 
+## [0.4.0] - 2026-07-16
+
+Port of the applicable qmd v2.1.0–v2.6.3 fixes, plus repairs to picoqmd's
+own retrieval path found while porting. First release with a test suite
+(`go test ./...`).
+
+### Fixed
+
+- **FTS5 queries with dots, hyphens, or operator words no longer error.**
+  `toFTS5Query` previously emitted raw barewords (`v3.9.7*`), which are FTS5
+  syntax errors for any token containing `.`/`-`/`:` and turned words like
+  AND/OR/NOT into operators. Every term is now emitted as a quoted string
+  (`"v3.9.7"*`) so the tokenizer treats punctuation as separators — version
+  strings, hyphenated words, and operator words all match as phrases.
+  Punctuation-only queries return no results instead of erroring.
+  (qmd #463, #563)
+- **`get`/`multi_get` now return document content.** Both previously
+  returned only metadata — `Content` was never populated and `multi_get`'s
+  `maxBytes` was parsed but unused. Content is read from disk (the index
+  stores no full text; FTS is contentless by design).
+- **BM25 results now carry real snippets with line citations.** The FTS
+  table is contentless, so FTS5's `snippet()` always returned `""` — BM25
+  results (and therefore reranker input, which is title+snippet) had no
+  body text at all. Snippets are now extracted from the on-disk file for
+  the returned page, highlighted `>>>term<<<`, with `Line` set to the first
+  match (`path:L<n>` in output). `extractSnippet` now returns the match
+  offset rather than the window start, improving vector-result citations
+  too.
+- **Partially-embedded documents now resume.** A document with a single
+  embedded chunk counted as fully embedded and was never revisited —
+  `status` lied about pending counts after any interrupted embed run. A
+  document is now pending unless every chunk has a current vector.
+  `SkipNextUnembedded` handles both pending shapes (no chunks / missing
+  vectors) so the skip loop still terminates. (qmd #637)
+- **SQLite busy timeout raised to 120s** (from zombiezen's 10s default),
+  configurable via `PICOQMD_SQLITE_BUSY_TIMEOUT` (milliseconds, `0` =
+  fail-fast). A scheduled sync racing the MCP daemon or an embed worker now
+  queues instead of failing with `database is locked`. (qmd #686)
+
+### Added
+
+- **Line-range retrieval.** `get` accepts `:from` and `:from:count` ref
+  suffixes (`release.md:120:40`, `#abc123:8:2`), plus `--from`/`--lines`
+  flags (CLI) and `fromLine`/`maxLines` params (MCP). Out-of-range values
+  clamp. Output is line-numbered by default (`--no-line-numbers` /
+  `lineNumbers:false` to disable) with a `qmd://collection/path #docid
+  (lines X-Y of Z)` header; `--full-path`/`fullPath` swaps the header to
+  the on-disk path for piping into file tools. Refs also accept
+  `qmd://collection/path` URIs. (qmd v2.5.3)
+- **Embedding fingerprints.** Each vector is stamped with the embed model +
+  chunker version (`fp` column, auto-migrated). Changing either marks
+  affected documents pending for re-embed instead of silently searching
+  stale vectors; existing vectors are adopted under the current fingerprint
+  on first open (one-time, no forced re-embed). `status` shows the active
+  fingerprint. (qmd v2.5.0)
+- **`multi_get` skip reporting.** Files over `maxBytes` (default raised
+  10 KB → 64 KB) or unreadable on disk are listed as `[skipped ...]` lines
+  instead of being silently dropped. Duplicate matches across
+  comma-separated patterns are deduped. (qmd #701, #702)
+- **`--no-rerank` / `noRerank`.** Skips the LLM reranking stage and returns
+  RRF-fused order — pairs with the existing `--no-expand`. (qmd #370)
+
+### Notes
+
+- Deliberately not ported from qmd v2.1–v2.6.3: CJK trigram FTS (index
+  doubling contradicts the small-footprint goal), tree-sitter AST chunking
+  (needs cgo or a WASM runtime), `doctor`/`bench` (covered by `status` and
+  `compare.sh`), and all Node/launcher/Metal/npm-packaging fixes (no Node
+  runtime here).
+- picoqmd already stored literal paths and already weighted the original
+  query 2× in hybrid RRF, so qmd's #698 and #591 fixes don't apply.
+
 ## [0.3.0] - 2026-04-26
 
 Three architectural improvements ported from tobi's qmd v2.0.0. All changes are
