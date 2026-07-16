@@ -1,5 +1,26 @@
 # Changelog
 
+## [0.4.1] - 2026-07-16
+
+### Fixed
+
+- **Scoped embed runs could poison unrelated collections.** When
+  `embed -c <collection>` hit a zero-progress worker batch, the skip
+  fallback selected the first pending document **globally** instead of
+  within the scoped collection — and since both queries were unordered,
+  the skip often didn't even target the document the worker was stuck on.
+  In the worst case (a crashing worker) the loop silently marked thousands
+  of out-of-scope documents as "embedded" with dummy vectors, one per
+  iteration. `SkipNextUnembedded` now takes the collection scope, both it
+  and `UnembeddedHashes` share a deterministic `ORDER BY hash`, every skip
+  is logged with the document hash, and the orchestrator aborts after 10
+  consecutive zero-progress batches instead of churning for hours.
+
+  **If you ran v0.4.0 `embed -c` and saw inflated embedded counts**, repair
+  the index with:
+  `sqlite3 <index> "DELETE FROM content_vectors WHERE text='[skipped]' AND length(vec)=4; UPDATE content_vectors SET vec=NULL WHERE length(vec)=4;"`
+  then re-run `picoqmd embed`.
+
 ## [0.4.0] - 2026-07-16
 
 Port of the applicable qmd v2.1.0–v2.6.3 fixes, plus repairs to picoqmd's

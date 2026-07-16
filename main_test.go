@@ -313,9 +313,17 @@ func TestSkipNextUnembeddedProgresses(t *testing.T) {
 	hash := contentHash(content)
 	fp := embedFingerprint()
 
+	// Scoped skip must not touch documents outside its collection
+	if h, err := store.SkipNextUnembedded("other-collection"); err != nil || h != "" {
+		t.Errorf("skip in empty scope should be a no-op, got hash=%q err=%v", h, err)
+	}
+	if n, _ := store.CountUnembedded(fp, ""); n != 1 {
+		t.Errorf("out-of-scope skip touched the pending doc")
+	}
+
 	// Shape 1: no chunks at all
-	if err := store.SkipNextUnembedded(); err != nil {
-		t.Fatal(err)
+	if h, err := store.SkipNextUnembedded("kb"); err != nil || h == "" {
+		t.Fatalf("skip failed: hash=%q err=%v", h, err)
 	}
 	if n, _ := store.CountUnembedded(fp, ""); n != 0 {
 		t.Errorf("skip did not clear chunkless doc: pending=%d", n)
@@ -331,8 +339,8 @@ func TestSkipNextUnembeddedProgresses(t *testing.T) {
 	if err := store.StoreVector(hash, 0, []float32{1}, fp); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.SkipNextUnembedded(); err != nil {
-		t.Fatal(err)
+	if h, err := store.SkipNextUnembedded(""); err != nil || h != hash {
+		t.Fatalf("skip failed: hash=%q err=%v", h, err)
 	}
 	if n, _ := store.CountUnembedded(fp, ""); n != 0 {
 		t.Errorf("skip did not clear partially embedded doc: pending=%d", n)

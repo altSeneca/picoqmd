@@ -969,6 +969,12 @@ func embedAll(store *Store, collection string) error {
 	}
 
 	const batchSize = 500
+	// Backstop against pathological churn: a healthy run skips at most a
+	// handful of genuinely broken documents. A long run of consecutive
+	// zero-progress batches means something systemic (crashing worker,
+	// engine trouble) and must abort loudly rather than skip-loop for hours.
+	const maxConsecutiveSkips = 10
+	consecutiveSkips := 0
 	for {
 		remaining, err := store.CountUnembedded(fp, collection)
 		if err != nil {
@@ -1009,12 +1015,21 @@ func embedAll(store *Store, collection string) error {
 			log.Printf("  worker exited (%v), embedded %d docs in this batch", err, batchDone)
 		}
 		if batchDone == 0 {
-			infof("  No progress — skipping problematic document\n")
-			if skipErr := store.SkipNextUnembedded(); skipErr != nil {
+			consecutiveSkips++
+			if consecutiveSkips > maxConsecutiveSkips {
+				return fmt.Errorf("aborting after %d consecutive zero-progress batches — worker is failing systematically, not on individual documents (last worker error: %v)", maxConsecutiveSkips, err)
+			}
+			skippedHash, skipErr := store.SkipNextUnembedded(collection)
+			if skipErr != nil {
 				return fmt.Errorf("failed to skip document: %w", skipErr)
 			}
+			// Always log which document was skipped — bounded by
+			// maxConsecutiveSkips, and essential for diagnosing why a
+			// document never shows up in vector search.
+			log.Printf("  no progress — skipped document %.6s (marked embedded without vectors)", skippedHash)
 			continue
 		}
+		consecutiveSkips = 0
 		infof("  %d/%d documents embedded\n", total-newRemaining, total)
 	}
 

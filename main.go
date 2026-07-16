@@ -55,7 +55,7 @@ import (
 // ---------------------------------------------------------------------------
 
 const (
-	version       = "0.4.0"
+	version       = "0.4.1"
 	defaultDB     = "index.sqlite"
 	chunkTarget   = 900 // target tokens per chunk
 	chunkLookback = 200 // tokens to look back for break points
@@ -1086,7 +1086,9 @@ const pendingHashCond = `
 
 // UnembeddedHashes returns content hashes whose embeddings are missing,
 // incomplete, or stale relative to the given fingerprint. collection scopes
-// to one collection; "" means all.
+// to one collection; "" means all. Ordered by hash so the embed worker and
+// SkipNextUnembedded agree on which document is "next" — a skip must target
+// the document the worker is actually stuck on.
 func (s *Store) UnembeddedHashes(fp, collection string) ([]string, error) {
 	conn, err := s.pool.Take(context.Background())
 	if err != nil {
@@ -1096,7 +1098,7 @@ func (s *Store) UnembeddedHashes(fp, collection string) ([]string, error) {
 
 	var hashes []string
 	err = sqlitex.Execute(conn,
-		`SELECT DISTINCT d.hash FROM documents d WHERE `+pendingHashCond,
+		`SELECT DISTINCT d.hash FROM documents d WHERE `+pendingHashCond+` ORDER BY d.hash`,
 		&sqlitex.ExecOptions{
 			Args: []any{collection, fp},
 			ResultFunc: func(stmt *sqlite.Stmt) error {
@@ -1132,26 +1134,30 @@ func (s *Store) CountUnembedded(fp, collection string) (int, error) {
 
 // SkipNextUnembedded marks the next unembedded document as embedded (with empty
 // vector) so the orchestrator can make progress past problematic documents.
-func (s *Store) SkipNextUnembedded() error {
+// It MUST use the same collection scope and ordering as UnembeddedHashes —
+// a zero-progress worker is stuck on the first pending hash of ITS scope, and
+// skipping any other document poisons unrelated collections while never
+// unblocking the loop. Returns the skipped hash ("" if nothing was pending).
+func (s *Store) SkipNextUnembedded(collection string) (string, error) {
 	conn, err := s.pool.Take(context.Background())
 	if err != nil {
-		return err
+		return "", err
 	}
 	defer s.pool.Put(conn)
 
 	fp := embedFingerprint()
 	var hash string
 	err = sqlitex.Execute(conn,
-		`SELECT DISTINCT d.hash FROM documents d WHERE `+pendingHashCond+` LIMIT 1`,
+		`SELECT DISTINCT d.hash FROM documents d WHERE `+pendingHashCond+` ORDER BY d.hash LIMIT 1`,
 		&sqlitex.ExecOptions{
-			Args: []any{"", fp},
+			Args: []any{collection, fp},
 			ResultFunc: func(stmt *sqlite.Stmt) error {
 				hash = stmt.ColumnText(0)
 				return nil
 			},
 		})
 	if err != nil || hash == "" {
-		return err
+		return "", err
 	}
 
 	// Cover both pending shapes: a document with no chunks at all gets a
@@ -1163,13 +1169,14 @@ func (s *Store) SkipNextUnembedded() error {
 	`, &sqlitex.ExecOptions{
 		Args: []any{hash, dummyVec, fp},
 	}); err != nil {
-		return err
+		return "", err
 	}
-	return sqlitex.Execute(conn, `
+	err = sqlitex.Execute(conn, `
 		UPDATE content_vectors SET vec = COALESCE(vec, ?), fp = ? WHERE hash = ? AND (vec IS NULL OR fp <> ?)
 	`, &sqlitex.ExecOptions{
 		Args: []any{dummyVec, fp, hash, fp},
 	})
+	return hash, err
 }
 
 // StoreChunks persists chunked text for a document hash.
