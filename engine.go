@@ -15,19 +15,24 @@ import (
 // ---------------------------------------------------------------------------
 
 // Embedder abstracts the LLM engine for embedding, query expansion, and reranking.
+//
+// `intent`, where present, is an optional disambiguation hint supplied by the
+// caller. Implementations should treat empty `intent` as "no hint" and behave
+// exactly as they did before this parameter existed.
 type Embedder interface {
 	Embed(text string, isQuery bool) ([]float32, error)
 	BatchEmbed(texts []string) ([][]float32, error)
-	ExpandQuery(query string) ([]QueryExpansion, error)
-	Rerank(query string, candidates []string) ([]float64, error)
+	ExpandQuery(query, intent string) ([]QueryExpansion, error)
+	Rerank(query, intent string, candidates []string) ([]float64, error)
 	Close()
 	ModelsDir() string
 	EnsureLib() error
 }
 
-// Searcher abstracts hybrid/vector search pipelines.
+// Searcher abstracts hybrid/vector search pipelines. `intent` is optional and
+// disambiguates the query across expansion, reranking, and snippet selection.
 type Searcher interface {
-	Search(ctx context.Context, query, collection string, limit int) ([]SearchResult, error)
+	Search(ctx context.Context, query, intent, collection string, limit int) ([]SearchResult, error)
 }
 
 // ---------------------------------------------------------------------------
@@ -37,6 +42,16 @@ type Searcher interface {
 type QueryExpansion struct {
 	Query string `json:"query"`
 	Type  string `json:"type"` // "lex" or "vec"
+}
+
+// combineForSnippet merges the user's query and intent into a single string
+// suitable for snippet anchoring (`queryTerms` + highlight). The vector
+// embedding is unaffected — only snippet selection sees the combined text.
+func combineForSnippet(query, intent string) string {
+	if intent == "" {
+		return query
+	}
+	return query + " " + intent
 }
 
 type ModelSpec struct {

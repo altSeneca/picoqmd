@@ -33,14 +33,16 @@ func (e *stubEngine) BatchEmbed(texts []string) ([][]float32, error) {
 	return nil, fmt.Errorf("embedding not supported on this platform")
 }
 
-func (e *stubEngine) ExpandQuery(query string) ([]QueryExpansion, error) {
+func (e *stubEngine) ExpandQuery(query, intent string) ([]QueryExpansion, error) {
+	_ = intent // stub has no LLM, so intent is irrelevant
 	return []QueryExpansion{
 		{Query: query, Type: "lex"},
 		{Query: query, Type: "vec"},
 	}, nil
 }
 
-func (e *stubEngine) Rerank(query string, candidates []string) ([]float64, error) {
+func (e *stubEngine) Rerank(query, intent string, candidates []string) ([]float64, error) {
+	_ = intent
 	scores := make([]float64, len(candidates))
 	for i := range scores {
 		scores[i] = 0.5
@@ -64,7 +66,8 @@ func newHybridSearcher(store *Store, engine Embedder) Searcher {
 	return &BM25OnlySearcher{store: store}
 }
 
-func (s *BM25OnlySearcher) Search(ctx context.Context, query, collection string, limit int) ([]SearchResult, error) {
+func (s *BM25OnlySearcher) Search(ctx context.Context, query, intent, collection string, limit int) ([]SearchResult, error) {
+	_ = intent // stub has no LLM stages where intent matters; snippet will pick it up below
 	// 1. BM25 seed
 	var bm25Results []SearchResult
 	var err error
@@ -130,8 +133,10 @@ func (s *BM25OnlySearcher) Search(ctx context.Context, query, collection string,
 		}
 	}
 
-	// 4. SearchVector with centroid for ranking
-	vecResults, err := s.store.SearchVector(centroid, limit)
+	// 4. SearchVector with centroid for ranking. Pass query+intent so snippet
+	// selection anchors on user terms even though the vector itself is the
+	// BM25 centroid.
+	vecResults, err := s.store.SearchVector(combineForSnippet(query, intent), centroid, limit)
 	if err != nil || len(vecResults) == 0 {
 		if len(bm25Results) > limit {
 			bm25Results = bm25Results[:limit]

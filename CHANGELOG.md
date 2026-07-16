@@ -1,5 +1,72 @@
 # Changelog
 
+## [0.3.0] - 2026-04-26
+
+Three architectural improvements ported from tobi's qmd v2.0.0. All changes are
+additive — empty `--intent` and absent `noExpand` argument reproduce 0.2.2
+behavior exactly.
+
+### Added
+
+- **Strong-signal expansion bypass.** The hybrid pipeline now probes BM25
+  before invoking the 1.7B query-expansion model. When the top BM25 result is
+  at least 2× the score at rank 3 (scale-free, so it works against both raw
+  FTS5 BM25 and RRF-normalized scores), the LLM expansion stage is skipped
+  entirely. Saves 150–400ms per query on obvious literal matches without
+  giving anything up — ambiguous/conceptual queries still flow through the
+  full expansion path. The probe's BM25 results are reused as the lex-side
+  rank list, so this is also one fewer BM25 call on every hybrid search.
+- **`--no-expand` CLI flag** and corresponding `noExpand` argument on the
+  `deep_search` MCP tool. Forces the bypass on regardless of probe outcome —
+  useful for benchmarking and reproducing pre-bypass behavior.
+- **BM25-aware snippets for vector results.** Vector and hybrid results no
+  longer ship with empty `Snippet` strings. The winning chunk's text is run
+  through a new `extractSnippet` helper that picks a window around the first
+  query-term hit and highlights all term occurrences with `>>>...<<<` (the
+  same format FTS5 already emits for BM25 paths). New `Line` field on
+  `SearchResult` carries a 1-based line number computed from the winning
+  chunk's byte position; the text/csv/files/md output formats now print
+  `path:L<line>` so editors can jump directly to the citation.
+- **`intent` parameter end-to-end.** Optional disambiguation hint threaded
+  through query expansion, reranking, and snippet selection. CLI: `--intent`.
+  MCP: optional `intent` property on `search`, `vector_search`, `deep_search`,
+  and `research`. Empty intent reproduces prior behavior. The expansion
+  prompt includes intent when present so generated alternatives stay in the
+  user's frame; the rerank prompt includes intent so the cross-encoder scores
+  against the intended meaning; snippets union query and intent terms when
+  picking the highlight window.
+
+### Changed
+
+- **Public Store API:** `SearchVector` and `SearchVectorInCollection` now take
+  the original text query as the first argument. Pass `""` if you only have
+  the vector and don't need query-aware snippets. The text is used solely for
+  snippet term-extraction; the embedding still drives ranking.
+- **Embedder interface:** `ExpandQuery(query, intent)` and
+  `Rerank(query, intent, candidates)` now accept an optional intent hint.
+  Existing callers that pass `""` get unchanged behavior.
+- **Searcher interface:** `Search(ctx, query, intent, collection, limit)`
+  gains an intent argument.
+
+### Why these are worth porting
+
+`qmd` v2.0.0 introduced the `intent` parameter, a strong-signal bypass, and
+BM25-aware snippets independently of each other; together they remove the
+biggest perceived-latency cost on common queries (the LLM expansion call) and
+make vector results actually citeable. The SDK split that qmd also did is
+deferred here — picoqmd is currently consumed only via CLI and MCP, so
+splitting `package main` into `pkg/store` and friends would be speculative
+work without a real second consumer.
+
+### Operator notes
+
+- The MCP tool schema gained two new optional properties (`intent` everywhere
+  hybrid/vector/research run, `noExpand` on `deep_search`). Existing clients
+  that don't send these continue to work.
+- The `Line` field on `SearchResult` is `omitempty` in JSON and `0` means
+  "unknown" — older consumers that ignore unknown fields are unaffected.
+- The chunks table schema is unchanged; no re-indexing required.
+
 ## [0.2.2] - 2026-04-26
 
 Two related fixes for unattended operation under launchd, cron, or any

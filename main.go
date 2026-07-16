@@ -53,7 +53,7 @@ import (
 // ---------------------------------------------------------------------------
 
 const (
-	version           = "0.2.2"
+	version           = "0.3.0"
 	defaultDB         = "index.sqlite"
 	chunkTarget       = 900  // target tokens per chunk
 	chunkLookback     = 200  // tokens to look back for break points
@@ -65,6 +65,13 @@ const (
 	// BM25 tuning: target parameters (FTS5 hardcodes k1=1.2, b=0.75)
 	bm25TargetB  = 0.55 // lower b → less penalty on long docs (default FTS5: 0.75)
 	bm25DefaultB = 0.75 // FTS5 built-in value
+
+	// Strong-signal expansion bypass: skip the LLM ExpandQuery stage when BM25
+	// alone gives a clear winner. Scale-free since SearchBM25 and
+	// SearchBM25Normalized return scores on different scales.
+	strongSignalRatio   = 2.0 // top-1 must be at least this multiple of top-N
+	strongSignalRankN   = 3   // index used for the comparator (3 → top-1 vs top-3)
+	strongSignalProbeN  = 20  // candidates pulled by the probe BM25 call
 )
 
 // skipDirs are directories that should never be traversed during indexing.
@@ -170,6 +177,7 @@ type SearchResult struct {
 	Title   string  `json:"title"`
 	Score   float64 `json:"score"`
 	Snippet string  `json:"snippet,omitempty"`
+	Line    int     `json:"line,omitempty"` // 1-based line where the snippet window begins (0 = unknown)
 	Context string  `json:"context,omitempty"`
 }
 
@@ -596,17 +604,20 @@ func (s *Store) SearchBM25Normalized(query string, limit int) ([]SearchResult, e
 	return results, nil
 }
 
-// SearchVector performs optimized cosine similarity search over stored embeddings.
-func (s *Store) SearchVector(queryVec []float32, limit int) ([]SearchResult, error) {
-	return s.searchVector(queryVec, "", limit)
+// SearchVector performs optimized cosine similarity search over stored
+// embeddings. `query` is the original text query and is used purely for
+// snippet selection — pass "" if you only have the vector and don't need
+// query-aware snippets.
+func (s *Store) SearchVector(query string, queryVec []float32, limit int) ([]SearchResult, error) {
+	return s.searchVector(query, queryVec, "", limit)
 }
 
 // SearchVectorInCollection performs vector search scoped to a single collection.
-func (s *Store) SearchVectorInCollection(queryVec []float32, collection string, limit int) ([]SearchResult, error) {
-	return s.searchVector(queryVec, collection, limit)
+func (s *Store) SearchVectorInCollection(query string, queryVec []float32, collection string, limit int) ([]SearchResult, error) {
+	return s.searchVector(query, queryVec, collection, limit)
 }
 
-func (s *Store) searchVector(queryVec []float32, collection string, limit int) ([]SearchResult, error) {
+func (s *Store) searchVector(query string, queryVec []float32, collection string, limit int) ([]SearchResult, error) {
 	conn, err := s.pool.Take(context.Background())
 	if err != nil {
 		return nil, err
@@ -633,7 +644,11 @@ func (s *Store) searchVector(queryVec []float32, collection string, limit int) (
 		}
 	}
 
-	bestByHash := make(map[string]float64)
+	type bestChunk struct {
+		score float64
+		seq   int
+	}
+	bestByHash := make(map[string]bestChunk)
 
 	vecDim := len(queryVec)
 	queryF64 := make([]float64, vecDim)
@@ -650,22 +665,23 @@ func (s *Store) searchVector(queryVec []float32, collection string, limit int) (
 
 	decodeBuf := make([]float32, vecDim)
 
-	err = sqlitex.Execute(conn, `SELECT hash, vec FROM content_vectors WHERE vec IS NOT NULL`,
+	err = sqlitex.Execute(conn, `SELECT hash, seq, vec FROM content_vectors WHERE vec IS NOT NULL`,
 		&sqlitex.ExecOptions{
 			ResultFunc: func(stmt *sqlite.Stmt) error {
 				h := stmt.ColumnText(0)
+				seq := stmt.ColumnInt(1)
 
 				// Skip hashes not in the target collection
 				if collectionHashes != nil && !collectionHashes[h] {
 					return nil
 				}
 
-				vecLen := stmt.ColumnLen(1)
+				vecLen := stmt.ColumnLen(2)
 				if vecLen != vecDim*4 {
 					return nil
 				}
 				raw := make([]byte, vecLen)
-				stmt.ColumnBytes(1, raw)
+				stmt.ColumnBytes(2, raw)
 				for i := 0; i < vecDim; i++ {
 					bits := uint32(raw[i*4]) | uint32(raw[i*4+1])<<8 | uint32(raw[i*4+2])<<16 | uint32(raw[i*4+3])<<24
 					decodeBuf[i] = math.Float32frombits(bits)
@@ -697,8 +713,8 @@ func (s *Store) searchVector(queryVec []float32, collection string, limit int) (
 				}
 				sim := dot / (queryNorm * docNorm)
 
-				if sim > bestByHash[h] {
-					bestByHash[h] = sim
+				if cur, ok := bestByHash[h]; !ok || sim > cur.score {
+					bestByHash[h] = bestChunk{score: sim, seq: seq}
 				}
 				return nil
 			},
@@ -710,22 +726,26 @@ func (s *Store) searchVector(queryVec []float32, collection string, limit int) (
 	type scored struct {
 		hash  string
 		score float64
+		seq   int
 	}
 	sorted_ := make([]scored, 0, len(bestByHash))
-	for h, sc := range bestByHash {
-		sorted_ = append(sorted_, scored{h, sc})
+	for h, b := range bestByHash {
+		sorted_ = append(sorted_, scored{h, b.score, b.seq})
 	}
 	sort.Slice(sorted_, func(i, j int) bool { return sorted_[i].score > sorted_[j].score })
 	if len(sorted_) > limit {
 		sorted_ = sorted_[:limit]
 	}
 
+	terms := queryTerms(query)
+
 	var results []SearchResult
 	for _, s2 := range sorted_ {
 		var r SearchResult
+		var absPath string
 		r.Score = s2.score
 		err = sqlitex.Execute(conn, `
-			SELECT d.docid, d.path, d.title, c.context
+			SELECT d.docid, d.path, d.title, c.context, c.path
 			FROM documents d
 			JOIN collections c ON c.id = d.col_id
 			WHERE d.hash = ? AND d.active = 1
@@ -737,15 +757,37 @@ func (s *Store) searchVector(queryVec []float32, collection string, limit int) (
 					r.Path = stmt.ColumnText(1)
 					r.Title = stmt.ColumnText(2)
 					r.Context = stmt.ColumnText(3)
+					absPath = filepath.Join(stmt.ColumnText(4), r.Path)
 					return nil
 				},
 			})
 		if err != nil {
 			continue
 		}
-		if r.DocID != "" {
-			results = append(results, r)
+		if r.DocID == "" {
+			continue
 		}
+
+		// Pull the winning chunk's text + position so we can build a
+		// query-aware snippet and an absolute line number.
+		var chunkText string
+		var chunkPos int
+		_ = sqlitex.Execute(conn, `SELECT text, pos FROM content_vectors WHERE hash = ? AND seq = ? LIMIT 1`,
+			&sqlitex.ExecOptions{
+				Args: []any{s2.hash, s2.seq},
+				ResultFunc: func(stmt *sqlite.Stmt) error {
+					chunkText = stmt.ColumnText(0)
+					chunkPos = stmt.ColumnInt(1)
+					return nil
+				},
+			})
+		if chunkText != "" {
+			snippet, windowStart := extractSnippet(chunkText, terms, 200)
+			r.Snippet = snippet
+			r.Line = computeLineNumber(absPath, chunkPos+windowStart)
+		}
+
+		results = append(results, r)
 	}
 	return results, nil
 }
@@ -1377,8 +1419,10 @@ func (m *MCPServer) buildInstructions() string {
 }
 
 func (m *MCPServer) toolDefinitions() []map[string]any {
+	intentDesc := "Optional purpose/disambiguation hint that guides expansion, reranking, and snippet selection. Empty = unchanged behavior."
 	searchSchema := map[string]any{"type": "object", "properties": map[string]any{
 		"query":      map[string]any{"type": "string", "description": "Search query"},
+		"intent":     map[string]any{"type": "string", "description": intentDesc},
 		"limit":      map[string]any{"type": "integer", "description": "Max results (default 10)"},
 		"collection": map[string]any{"type": "string", "description": "Filter to a specific collection"},
 		"minScore":   map[string]any{"type": "number", "description": "Minimum score threshold (default 0)"},
@@ -1397,6 +1441,7 @@ func (m *MCPServer) toolDefinitions() []map[string]any {
 			"name": "vector_search", "description": "Semantic vector search — finds related concepts even when exact words differ",
 			"inputSchema": map[string]any{"type": "object", "properties": map[string]any{
 				"query":      map[string]any{"type": "string", "description": "Search query"},
+				"intent":     map[string]any{"type": "string", "description": intentDesc},
 				"limit":      map[string]any{"type": "integer", "description": "Max results (default 10)"},
 				"collection": map[string]any{"type": "string", "description": "Filter to a specific collection"},
 				"minScore":   map[string]any{"type": "number", "description": "Minimum score threshold (default 0.3)"},
@@ -1405,11 +1450,21 @@ func (m *MCPServer) toolDefinitions() []map[string]any {
 			}, "required": []string{"query"}}})
 		tools = append(tools, map[string]any{
 			"name": "deep_search", "description": "Full hybrid pipeline: auto-expands query into variations, searches each by keyword and meaning, reranks for top hits",
-			"inputSchema": searchSchema})
+			"inputSchema": map[string]any{"type": "object", "properties": map[string]any{
+				"query":      map[string]any{"type": "string", "description": "Search query"},
+				"intent":     map[string]any{"type": "string", "description": intentDesc},
+				"limit":      map[string]any{"type": "integer", "description": "Max results (default 10)"},
+				"collection": map[string]any{"type": "string", "description": "Filter to a specific collection"},
+				"minScore":   map[string]any{"type": "number", "description": "Minimum score threshold (default 0)"},
+				"maxChars":   map[string]any{"type": "integer", "description": "Truncate total response to this many characters (server-side token budget)"},
+				"note":       map[string]any{"type": "string", "description": "Save an observation linked to the top result (persisted across sessions, auto-flagged stale when source changes)"},
+				"noExpand":   map[string]any{"type": "boolean", "description": "Skip the LLM query-expansion stage even if the strong-signal probe would otherwise run it. Useful for benchmarking."},
+			}, "required": []string{"query"}}})
 		tools = append(tools, map[string]any{
 			"name": "research", "description": "Composite search: runs BM25 + vector in parallel, deduplicates by docid via RRF, and merges within a token budget. One call instead of two.",
 			"inputSchema": map[string]any{"type": "object", "properties": map[string]any{
 				"query":      map[string]any{"type": "string", "description": "Search query"},
+				"intent":     map[string]any{"type": "string", "description": intentDesc},
 				"limit":      map[string]any{"type": "integer", "description": "Max results (default 10)"},
 				"collection": map[string]any{"type": "string", "description": "Filter to a specific collection"},
 				"minScore":   map[string]any{"type": "number", "description": "Minimum score threshold (default 0)"},
@@ -1449,6 +1504,7 @@ func (m *MCPServer) callTool(params json.RawMessage) (any, error) {
 
 	var args struct {
 		Query      string  `json:"query"`
+		Intent     string  `json:"intent"`
 		Ref        string  `json:"ref"`
 		Pattern    string  `json:"pattern"`
 		Limit      int     `json:"limit"`
@@ -1458,6 +1514,7 @@ func (m *MCPServer) callTool(params json.RawMessage) (any, error) {
 		MaxLines   int     `json:"maxLines"`
 		MaxChars   int     `json:"maxChars"`
 		Note       string  `json:"note"`
+		NoExpand   bool    `json:"noExpand"`
 	}
 	if err := json.Unmarshal(call.Arguments, &args); err != nil {
 		return nil, fmt.Errorf("invalid tool arguments: %w", err)
@@ -1536,11 +1593,12 @@ func (m *MCPServer) callTool(params json.RawMessage) (any, error) {
 		if err != nil {
 			return nil, err
 		}
+		snippetText := combineForSnippet(args.Query, args.Intent)
 		var results []SearchResult
 		if args.Collection != "" {
-			results, err = m.store.SearchVectorInCollection(qvec, args.Collection, args.Limit)
+			results, err = m.store.SearchVectorInCollection(snippetText, qvec, args.Collection, args.Limit)
 		} else {
-			results, err = m.store.SearchVector(qvec, args.Limit)
+			results, err = m.store.SearchVector(snippetText, qvec, args.Limit)
 		}
 		if err != nil {
 			return nil, err
@@ -1554,7 +1612,10 @@ func (m *MCPServer) callTool(params json.RawMessage) (any, error) {
 		return applyMaxChars(toolResult(filtered), args.MaxChars), nil
 
 	case "deep_search":
-		results, err := m.hybrid.Search(context.Background(), args.Query, args.Collection, args.Limit)
+		if t, ok := m.hybrid.(interface{ SetNoExpand(bool) }); ok {
+			t.SetNoExpand(args.NoExpand)
+		}
+		results, err := m.hybrid.Search(context.Background(), args.Query, args.Intent, args.Collection, args.Limit)
 		if err != nil {
 			return nil, err
 		}
@@ -1572,10 +1633,11 @@ func (m *MCPServer) callTool(params json.RawMessage) (any, error) {
 		}
 		var vecResults []SearchResult
 		if qvec, err := m.engine.Embed(args.Query, true); err == nil {
+			snippetText := combineForSnippet(args.Query, args.Intent)
 			if args.Collection != "" {
-				vecResults, _ = m.store.SearchVectorInCollection(qvec, args.Collection, args.Limit*2)
+				vecResults, _ = m.store.SearchVectorInCollection(snippetText, qvec, args.Collection, args.Limit*2)
 			} else {
-				vecResults, _ = m.store.SearchVector(qvec, args.Limit*2)
+				vecResults, _ = m.store.SearchVector(snippetText, qvec, args.Limit*2)
 			}
 		}
 		merged := simpleRRF(bm25Results, vecResults, args.Limit)
@@ -1975,6 +2037,168 @@ func extractTitle(content, fallback string) string {
 	return strings.TrimSuffix(filepath.Base(fallback), filepath.Ext(fallback))
 }
 
+// snippetStopWords are common English fillers we don't anchor snippet windows
+// or highlights on. Mirrors the FTS5 default stoplist loosely.
+var snippetStopWords = map[string]bool{
+	"the": true, "a": true, "an": true, "and": true, "or": true, "but": true,
+	"of": true, "in": true, "on": true, "at": true, "to": true, "for": true,
+	"is": true, "are": true, "was": true, "were": true, "be": true,
+	"by": true, "with": true, "from": true, "as": true, "it": true,
+	"this": true, "that": true, "these": true, "those": true,
+	"i": true, "you": true, "he": true, "she": true, "we": true, "they": true,
+}
+
+// queryTerms tokenizes a free-text query into stoplist-filtered terms suitable
+// for snippet anchoring and highlighting.
+func queryTerms(query string) []string {
+	if query == "" {
+		return nil
+	}
+	fields := strings.Fields(query)
+	out := make([]string, 0, len(fields))
+	for _, f := range fields {
+		f = strings.Trim(f, ".,;:!?'\"()[]{}*")
+		if len(f) < 2 {
+			continue
+		}
+		if snippetStopWords[strings.ToLower(f)] {
+			continue
+		}
+		out = append(out, f)
+	}
+	return out
+}
+
+// extractSnippet picks a window around the first occurrence of any `term` in
+// `text` and highlights all term occurrences inside the window with
+// >>>...<<< (matching the FTS5 BM25 snippet format already used elsewhere).
+// If no terms are found, returns the head of the text. Returns the snippet and
+// the byte offset where the window starts within `text`.
+func extractSnippet(text string, terms []string, windowChars int) (snippet string, windowStart int) {
+	if len(text) == 0 || windowChars <= 0 {
+		return "", 0
+	}
+	lower := strings.ToLower(text)
+
+	firstHit := -1
+	for _, term := range terms {
+		t := strings.ToLower(term)
+		if len(t) < 2 {
+			continue
+		}
+		if i := strings.Index(lower, t); i >= 0 {
+			if firstHit < 0 || i < firstHit {
+				firstHit = i
+			}
+		}
+	}
+
+	if firstHit < 0 {
+		// No hits — return the head.
+		if len(text) <= windowChars {
+			return text, 0
+		}
+		end := windowChars
+		for end < len(text) && !isSnippetBoundary(text[end]) {
+			end++
+		}
+		return text[:end] + "...", 0
+	}
+
+	// Center the window around firstHit, biased a bit toward earlier text so
+	// the term appears past the visual middle.
+	start := firstHit - windowChars/3
+	if start < 0 {
+		start = 0
+	}
+	end := start + windowChars
+	if end > len(text) {
+		end = len(text)
+		start = end - windowChars
+		if start < 0 {
+			start = 0
+		}
+	}
+
+	// Align to word boundaries so we don't slice through tokens.
+	for start > 0 && !isSnippetBoundary(text[start-1]) {
+		start--
+	}
+	for end < len(text) && !isSnippetBoundary(text[end]) {
+		end++
+	}
+
+	window := text[start:end]
+	for _, term := range terms {
+		if len(term) < 2 {
+			continue
+		}
+		window = highlightCI(window, term, ">>>", "<<<")
+	}
+
+	if start > 0 {
+		window = "..." + window
+	}
+	if end < len(text) {
+		window = window + "..."
+	}
+	return window, start
+}
+
+func isSnippetBoundary(b byte) bool {
+	switch b {
+	case ' ', '\n', '\t', '.', ',', ';', ':', '!', '?', ')', ']', '}', '"':
+		return true
+	}
+	return false
+}
+
+// highlightCI wraps every case-insensitive occurrence of `term` in `text`
+// with `prefix`/`suffix`, preserving the original casing of the matched span.
+func highlightCI(text, term, prefix, suffix string) string {
+	if len(term) == 0 {
+		return text
+	}
+	lowerText := strings.ToLower(text)
+	lowerTerm := strings.ToLower(term)
+	tlen := len(term)
+
+	var b strings.Builder
+	b.Grow(len(text) + 8)
+	i := 0
+	for i < len(text) {
+		idx := strings.Index(lowerText[i:], lowerTerm)
+		if idx < 0 {
+			b.WriteString(text[i:])
+			break
+		}
+		b.WriteString(text[i : i+idx])
+		b.WriteString(prefix)
+		b.WriteString(text[i+idx : i+idx+tlen])
+		b.WriteString(suffix)
+		i += idx + tlen
+	}
+	return b.String()
+}
+
+// computeLineNumber returns the 1-based line number at byte offset `pos`
+// within the file at `absPath`. Returns 0 if the file can't be read or pos is
+// out of range — callers treat 0 as "unknown".
+func computeLineNumber(absPath string, pos int) int {
+	if absPath == "" || pos <= 0 {
+		return 0
+	}
+	f, err := os.Open(absPath)
+	if err != nil {
+		return 0
+	}
+	defer f.Close()
+
+	buf := make([]byte, pos)
+	n, _ := io.ReadFull(f, buf)
+	return bytes.Count(buf[:n], []byte("\n")) + 1
+}
+
 func toFTS5Query(query string) string {
 	words := strings.Fields(query)
 	if len(words) == 0 {
@@ -2147,9 +2371,11 @@ func main() {
 	var searchLimit int
 	var searchFormat string
 	var remoteAddr string
+	var noExpand bool
+	var searchIntent string
 
 	// --- smartSearch dispatches to the best available pipeline ---
-	smartSearch := func(query string, store *Store, engine Embedder, limit int, format string) error {
+	smartSearch := func(query, intent string, store *Store, engine Embedder, limit int, format string) error {
 		hasEmbed := modelExists(engine.ModelsDir(), defaultModels[0].Filename)
 		hasRerank := modelExists(engine.ModelsDir(), defaultModels[1].Filename)
 		hasExpand := modelExists(engine.ModelsDir(), defaultModels[2].Filename)
@@ -2157,7 +2383,10 @@ func main() {
 		// Full hybrid: all 3 models available
 		if hasEmbed && hasRerank && hasExpand {
 			hybrid := newHybridSearcher(store, engine)
-			results, err := hybrid.Search(context.Background(), query, "", limit)
+			if t, ok := hybrid.(interface{ SetNoExpand(bool) }); ok {
+				t.SetNoExpand(noExpand)
+			}
+			results, err := hybrid.Search(context.Background(), query, intent, "", limit)
 			if err != nil {
 				return err
 			}
@@ -2169,7 +2398,7 @@ func main() {
 			bm25Results, _ := store.SearchBM25(query, limit*2)
 			qvec, err := engine.Embed(query, true)
 			if err == nil {
-				vecResults, _ := store.SearchVector(qvec, limit*2)
+				vecResults, _ := store.SearchVector(combineForSnippet(query, intent), qvec, limit*2)
 				return printResults(simpleRRF(bm25Results, vecResults, limit), format)
 			}
 			if len(bm25Results) > limit {
@@ -2217,7 +2446,7 @@ Quick start:
 			defer store.Close()
 
 			engine := NewLLMEngine(cacheDir())
-			return smartSearch(query, store, engine, searchLimit, searchFormat)
+			return smartSearch(query, searchIntent, store, engine, searchLimit, searchFormat)
 		},
 	}
 	root.PersistentFlags().StringVar(&indexName, "index", "", "named index (separate DB + config)")
@@ -2226,6 +2455,8 @@ Quick start:
 	root.PersistentFlags().StringVar(&remoteAddr, "remote", "", "forward searches to remote picoqmd MCP server (host:port)")
 	root.PersistentFlags().BoolVar(&quiet, "quiet", quiet, "suppress per-document progress output (auto-enabled when stdout is not a terminal)")
 	root.PersistentFlags().BoolVar(new(bool), "verbose", false, "force progress output even when stdout is not a terminal")
+	root.PersistentFlags().BoolVar(&noExpand, "no-expand", false, "skip the LLM query-expansion stage (forces strong-signal-only behavior)")
+	root.PersistentFlags().StringVar(&searchIntent, "intent", "", "optional disambiguation hint passed to expansion, reranking, and snippet selection")
 	// --verbose overrides the auto-quiet behavior. We can't share a single
 	// bool with --quiet (cobra rejects that), so we fix it up after parse:
 	root.PersistentPreRunE = func(cmd *cobra.Command, args []string) error {
@@ -2430,7 +2661,7 @@ Quick start:
 				return err
 			}
 
-			results, err := store.SearchVector(qvec, limit)
+			results, err := store.SearchVector(combineForSnippet(query, searchIntent), qvec, limit)
 			if err != nil {
 				return err
 			}
@@ -2462,7 +2693,10 @@ Quick start:
 
 			engine := NewLLMEngine(cacheDir())
 			hybrid := newHybridSearcher(store, engine)
-			results, err := hybrid.Search(context.Background(), query, "", limit)
+			if t, ok := hybrid.(interface{ SetNoExpand(bool) }); ok {
+				t.SetNoExpand(noExpand)
+			}
+			results, err := hybrid.Search(context.Background(), query, searchIntent, "", limit)
 			if err != nil {
 				return err
 			}
@@ -2746,6 +2980,15 @@ Quick start:
 // Output formatting
 // ---------------------------------------------------------------------------
 
+// pathWithLine returns the result's path with `:L<n>` appended when the line
+// number is known. Mirrors the convention used by `picoqmd get path:line`.
+func pathWithLine(r SearchResult) string {
+	if r.Line > 0 {
+		return fmt.Sprintf("%s:L%d", r.Path, r.Line)
+	}
+	return r.Path
+}
+
 func printResults(results []SearchResult, format string) error {
 	switch format {
 	case "json":
@@ -2754,15 +2997,16 @@ func printResults(results []SearchResult, format string) error {
 	case "csv":
 		fmt.Println("docid,score,path,context")
 		for _, r := range results {
-			fmt.Printf("%s,%.4f,%s,%s\n", r.DocID, r.Score, r.Path, r.Context)
+			fmt.Printf("%s,%.4f,%s,%s\n", r.DocID, r.Score, pathWithLine(r), r.Context)
 		}
 	case "files":
 		for _, r := range results {
-			fmt.Println(r.Path)
+			fmt.Println(pathWithLine(r))
 		}
 	case "md":
 		for i, r := range results {
 			fmt.Printf("### %d. %s (`#%s` — %.4f)\n", i+1, r.Title, r.DocID, r.Score)
+			fmt.Printf("`%s`\n\n", pathWithLine(r))
 			if r.Snippet != "" {
 				fmt.Printf("> %s\n\n", r.Snippet)
 			}
@@ -2770,6 +3014,7 @@ func printResults(results []SearchResult, format string) error {
 	default: // text
 		for i, r := range results {
 			fmt.Printf("%d. [#%s] %s (%.4f)\n", i+1, r.DocID, r.Title, r.Score)
+			fmt.Printf("   %s\n", pathWithLine(r))
 			if r.Snippet != "" {
 				fmt.Printf("   %s\n", r.Snippet)
 			}

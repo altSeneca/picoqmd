@@ -344,7 +344,7 @@ func (e *LLMEngine) BatchEmbed(texts []string) ([][]float32, error) {
 	return results, nil
 }
 
-func (e *LLMEngine) ExpandQuery(query string) ([]QueryExpansion, error) {
+func (e *LLMEngine) ExpandQuery(query, intent string) ([]QueryExpansion, error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
@@ -355,7 +355,12 @@ func (e *LLMEngine) ExpandQuery(query string) ([]QueryExpansion, error) {
 		}, nil
 	}
 
-	prompt := fmt.Sprintf("Expand this search query into two alternative queries.\nQuery: %s\n", query)
+	var prompt string
+	if intent != "" {
+		prompt = fmt.Sprintf("Expand this search query into two alternative queries that match the stated intent.\nIntent: %s\nQuery: %s\n", intent, query)
+	} else {
+		prompt = fmt.Sprintf("Expand this search query into two alternative queries.\nQuery: %s\n", query)
+	}
 
 	vocab := llama.ModelGetVocab(e.expandModel)
 	tokens := llama.Tokenize(vocab, prompt, true, false)
@@ -430,7 +435,7 @@ func parseExpansions(output, original string) []QueryExpansion {
 	return expansions
 }
 
-func (e *LLMEngine) Rerank(query string, candidates []string) ([]float64, error) {
+func (e *LLMEngine) Rerank(query, intent string, candidates []string) ([]float64, error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
@@ -446,7 +451,12 @@ func (e *LLMEngine) Rerank(query string, candidates []string) ([]float64, error)
 	scores := make([]float64, len(candidates))
 
 	for i, candidate := range candidates {
-		input := fmt.Sprintf("Query: %s\nDocument: %s\nRelevant:", query, candidate)
+		var input string
+		if intent != "" {
+			input = fmt.Sprintf("Intent: %s\nQuery: %s\nDocument: %s\nRelevant:", intent, query, candidate)
+		} else {
+			input = fmt.Sprintf("Query: %s\nDocument: %s\nRelevant:", query, candidate)
+		}
 
 		tokens := llama.Tokenize(vocab, input, true, false)
 		batch := llama.BatchGetOne(tokens)
@@ -487,18 +497,57 @@ func (e *LLMEngine) Rerank(query string, candidates []string) ([]float64, error)
 // ---------------------------------------------------------------------------
 
 type HybridSearcher struct {
-	store  *Store
-	engine Embedder
+	store     *Store
+	engine    Embedder
+	noExpand  bool // force-disable ExpandQuery (CLI/MCP override for benchmarking)
 }
 
 func newHybridSearcher(store *Store, engine Embedder) Searcher {
 	return &HybridSearcher{store: store, engine: engine}
 }
 
-func (h *HybridSearcher) Search(ctx context.Context, query, collection string, limit int) ([]SearchResult, error) {
-	expansions, err := h.engine.ExpandQuery(query)
-	if err != nil {
-		expansions = nil
+// SetNoExpand forces the LLM ExpandQuery stage off regardless of strong-signal
+// detection. Mainly used for benchmarking and the --no-expand CLI flag.
+func (h *HybridSearcher) SetNoExpand(v bool) { h.noExpand = v }
+
+// hasStrongSignal returns true when the top BM25 result dominates the rest by
+// at least strongSignalRatio× the score at strongSignalRankN. Scale-free, so
+// it works against both raw FTS5 BM25 scores and RRF-normalized scores.
+func hasStrongSignal(results []SearchResult) bool {
+	if len(results) < strongSignalRankN {
+		return false
+	}
+	top := results[0].Score
+	cmp := results[strongSignalRankN-1].Score
+	if top <= 0 || cmp <= 0 {
+		return false
+	}
+	return top >= strongSignalRatio*cmp
+}
+
+func (h *HybridSearcher) Search(ctx context.Context, query, intent, collection string, limit int) ([]SearchResult, error) {
+	// Probe BM25 first. Cheap (~ms) and lets us decide whether to spend
+	// 150–400ms running the LLM ExpandQuery model.
+	var probeBM25 []SearchResult
+	var probeErr error
+	if collection != "" {
+		probeBM25, probeErr = h.store.SearchBM25InCollection(query, collection, strongSignalProbeN)
+	} else {
+		probeBM25, probeErr = h.store.SearchBM25Normalized(query, strongSignalProbeN)
+	}
+	if probeErr != nil {
+		probeBM25 = nil
+	}
+
+	skipExpand := h.noExpand || hasStrongSignal(probeBM25)
+
+	var expansions []QueryExpansion
+	if !skipExpand {
+		var err error
+		expansions, err = h.engine.ExpandQuery(query, intent)
+		if err != nil {
+			expansions = nil
+		}
 	}
 
 	type weightedQuery struct {
@@ -521,26 +570,37 @@ func (h *HybridSearcher) Search(ctx context.Context, query, collection string, l
 	var listsMu sync.Mutex
 	var wg sync.WaitGroup
 
+	// Seed the lex side of the original query from the probe — saves one BM25
+	// call on every hybrid search.
+	probeUsed := false
+
 	for _, wq := range queries {
 		wq := wq
 		if wq.types == "both" || wq.types == "lex" {
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
-				var results []SearchResult
-				var err error
-				if collection != "" {
-					results, err = h.store.SearchBM25InCollection(wq.query, collection, 20)
-				} else {
-					results, err = h.store.SearchBM25Normalized(wq.query, 20)
+			if !probeUsed && wq.query == query {
+				probeUsed = true
+				if probeBM25 != nil {
+					allLists = append(allLists, rankedList{results: probeBM25, weight: wq.weight})
 				}
-				if err != nil {
-					return
-				}
-				listsMu.Lock()
-				allLists = append(allLists, rankedList{results: results, weight: wq.weight})
-				listsMu.Unlock()
-			}()
+			} else {
+				wg.Add(1)
+				go func() {
+					defer wg.Done()
+					var results []SearchResult
+					var err error
+					if collection != "" {
+						results, err = h.store.SearchBM25InCollection(wq.query, collection, strongSignalProbeN)
+					} else {
+						results, err = h.store.SearchBM25Normalized(wq.query, strongSignalProbeN)
+					}
+					if err != nil {
+						return
+					}
+					listsMu.Lock()
+					allLists = append(allLists, rankedList{results: results, weight: wq.weight})
+					listsMu.Unlock()
+				}()
+			}
 		}
 		if wq.types == "both" || wq.types == "vec" {
 			wg.Add(1)
@@ -550,11 +610,15 @@ func (h *HybridSearcher) Search(ctx context.Context, query, collection string, l
 				if err != nil {
 					return
 				}
+				// Anchor snippets on the user's original query+intent, not on
+				// the expansion variant — the expansion drives the embedding,
+				// but highlights should reflect the user's actual words.
+				snippetText := combineForSnippet(query, intent)
 				var results []SearchResult
 				if collection != "" {
-					results, err = h.store.SearchVectorInCollection(qvec, collection, 20)
+					results, err = h.store.SearchVectorInCollection(snippetText, qvec, collection, 20)
 				} else {
-					results, err = h.store.SearchVector(qvec, 20)
+					results, err = h.store.SearchVector(snippetText, qvec, 20)
 				}
 				if err != nil {
 					return
@@ -608,7 +672,7 @@ func (h *HybridSearcher) Search(ctx context.Context, query, collection string, l
 		candidateTexts = append(candidateTexts, doc.Title+" "+doc.Snippet)
 	}
 
-	rerankScores, err := h.engine.Rerank(query, candidateTexts)
+	rerankScores, err := h.engine.Rerank(query, intent, candidateTexts)
 	if err != nil {
 		var results []SearchResult
 		for _, entry := range rrfRanked {
