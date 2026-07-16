@@ -1,105 +1,63 @@
-# PicoQMD
+# PicoQMD — a lightweight QMD alternative for low-resource computers
 
-**The search MCP server that fits where your agent does.** Single binary, ~15MB, runs on a Raspberry Pi Zero.
+**A fully local search engine and MCP server in a single ~15MB Go binary.** PicoQMD is a from-scratch Go reimplementation of [tobi's QMD](https://github.com/tobi/qmd) built for machines where QMD's Node.js/Bun stack is too heavy: Raspberry Pi (including Pi Zero), old laptops, small VPSes, air-gapped boxes, and dev machines that just don't want another Node runtime.
 
-Give any AI agent — [OpenClaw](https://github.com/openinterface/openclaw), [PicoClaw](https://github.com/sipeed/picoclaw), [MiniClaw](https://github.com/mattdef/miniclaw), [Claude Code](https://docs.anthropic.com/en/docs/claude-code), or your own — instant local search over any text files: code, docs, configs, notes. No cloud. No Node.js. No Python. Just a Go binary and SQLite.
+Same search pipeline as QMD — SQLite FTS5 BM25, semantic vector search, hybrid query expansion + Reciprocal Rank Fusion + cross-encoder reranking, the same GGUF models — with no Node.js, no Bun, no Python, no npm install, no native-module ABI headaches. One static binary and a SQLite file.
 
-## Running under launchd / cron / systemd
+Give any AI agent — [Claude Code](https://docs.anthropic.com/en/docs/claude-code), [OpenClaw](https://github.com/openinterface/openclaw), [PicoClaw](https://github.com/sipeed/picoclaw), [MiniClaw](https://github.com/mattdef/miniclaw), or your own — instant local search over code, docs, configs, and notes. No cloud, no telemetry, works offline.
 
-picoqmd auto-detects when stdout is not a terminal (launchd, cron, pipes,
-`tee >file`) and suppresses per-document progress output to keep
-captured-stdout log files bounded. Force the behavior with `--quiet` or
-override it with `--verbose`. See [CHANGELOG.md](CHANGELOG.md) for v0.2.2
-details.
+## PicoQMD vs QMD
 
-If you previously ran picoqmd under launchd before v0.2.2, your
-StandardOutPath log file may be very large — safely truncate it with
-`: > /path/to/your/picoqmd.log`.
+If you're looking for **"QMD but for a lower-spec computer"**, this is the trade-off table:
+
+|  | QMD | PicoQMD |
+|--|-----|---------|
+| Install | Node.js/Bun + npm package (native modules: better-sqlite3, sqlite-vec, node-llama-cpp) | one static Go binary (~15MB) |
+| Runtime | Node/Bun VM | none — measured **~29MB peak RSS** for a BM25 search over a 10,800-doc index |
+| BM25 keyword search | SQLite FTS5 | SQLite FTS5 (pure-Go driver, contentless index — documents are not duplicated into the DB) |
+| Semantic vector search | sqlite-vec + node-llama-cpp | pure-Go brute-force cosine + llama.cpp via FFI (same EmbeddingGemma model) |
+| Hybrid pipeline | query expansion → fan-out → RRF → rerank | same design, same GGUF models |
+| MCP server | stdio + HTTP | stdio + HTTP |
+| Minimum hardware for keyword search | needs Node-capable box | Raspberry Pi Zero / ARM32 / RISC-V |
+| Vector/hybrid search | yes | yes, on arm64/amd64 (Linux, macOS) |
+| Line-numbered `get` with `:from:count` ranges | yes | yes (v0.4.0) |
+| Embedding fingerprints (stale-vector detection) | yes | yes (v0.4.0) |
+| AST/tree-sitter code chunking | yes | not yet ([roadmap](ROADMAP.md)) |
+| CJK trigram search | yes | no (kept out deliberately — doubles index size) |
+
+PicoQMD is not a fork — it's an independent Go implementation that tracks QMD's retrieval design and ports its fixes (v0.4.0 covers the applicable QMD v2.1–v2.6.3 changes). If you have a beefy dev machine and live in the Node ecosystem, use QMD. If you want the same local search quality in a fraction of the footprint — or on hardware QMD can't run on at all — use PicoQMD.
 
 ## Why PicoQMD?
 
 Most search tools assume beefy hardware. PicoQMD is built for the other end of the spectrum:
 
-- **~11MB binary** — smaller than most npm installs
-- **Minimal RAM** — BM25 mode needs almost nothing; runs alongside PicoClaw on $10 hardware
-- **Zero dependencies** — no runtime, no interpreters, no containers
+- **~15MB binary** (~11MB with `-ldflags="-s -w"`) — smaller than most npm installs
+- **Minimal RAM** — BM25 mode runs in tens of MB; fits alongside an agent on $10 hardware
+- **Zero dependencies** — no runtime, no interpreters, no containers, no C toolchain (pure-Go SQLite)
 - **MCP native** — stdio and HTTP transports, works with any MCP-compatible agent
-- **Pure Go** — cross-compiles to ARM32, ARM64, RISC-V, x86 in one command
+- **Cross-compiles anywhere Go does** — ARM32, ARM64, RISC-V, x86 in one command
 - **Scales up** — add semantic vector search and hybrid re-ranking when your hardware allows
-- **Graceful degradation** — without models, vector/hybrid/research tools are hidden from the agent; BM25, get, and observations still work
+- **Graceful degradation** — without models, vector/hybrid tools are hidden from the agent; BM25, get, and observations still work
+- **Safe under launchd/cron/systemd** — auto-quiets progress output when stdout is not a TTY, so captured logs stay bounded
 
-## What's New in v0.2.1
+## What's New in v0.4.0
 
-### Collection-Size Normalization
+Ports of the applicable QMD v2.1.0–v2.6.3 improvements, plus fixes to PicoQMD's own retrieval path (full details in [CHANGELOG.md](CHANGELOG.md)):
 
-Unscoped searches now use per-collection Reciprocal Rank Fusion so small collections (4 docs) get fair representation against large ones (800+ docs). Each collection is searched independently and results are interleaved by rank, not raw count. When you pass the `collection` parameter, searches are scoped directly to that collection.
-
-### BM25 Column Weights
-
-Title matches are now boosted 5x over content matches via FTS5 `bm25()` column weights: `title=5.0, content=1.0, docid=0.0`. A document whose title contains your query term now reliably outranks one that merely mentions it in the body.
-
-### Document Length Normalization (b-correction)
-
-FTS5 hardcodes BM25's `b` parameter at 0.75, which over-penalizes long documents. PicoQMD now applies a post-FTS5 correction that shifts `b` to 0.55 — reducing the length penalty so comprehensive source files and detailed docs score fairly against short notes. Document lengths are tracked during indexing (`doc_len` column).
-
----
-
-### v0.2.0
-
-### Composite `research` Tool
-
-One call replaces two. Runs BM25 + vector search in parallel, deduplicates results via Reciprocal Rank Fusion (K=60), and merges within a token budget — all server-side before results hit the agent's context window.
-
-```
-research({ query: "firebase auth flow", limit: 5, maxChars: 5000 })
-```
-
-Benchmark (3,145 docs indexed):
-
-| Approach | Time | Response Size |
-|----------|------|---------------|
-| search + vector_search (2 calls) | 1,585ms | 2,766 chars |
-| research (1 call) | 475ms | 1,351 chars |
-| **Savings** | **70% faster** | **51% fewer chars** |
-
-### `maxChars` — Server-Side Token Budget
-
-All search and retrieval tools now accept `maxChars` to truncate responses before they enter the context window. No more dumping entire files into agent context.
-
-```
-get({ ref: "MEMORY.md", maxChars: 500 })
-search({ query: "OSHA compliance", limit: 10, maxChars: 2000 })
-```
-
-### `note` — Observation-as-Sidecar
-
-Save insights in the same call as search — no separate tool call needed. Notes are linked to the top result's document ID and content hash.
-
-```
-search({ query: "severity colors", note: "defined in shared module SeverityLevel.kt" })
-```
-
-Observations are persisted to `~/.config/picoqmd/observations.json` and survive across sessions.
-
-### Stale Observation Flagging
-
-When a document's content changes after an observation was saved, the `research` tool automatically flags it `[STALE]` in results. The `status` tool reports the count of stale observations. No manual cleanup needed — stale context is surfaced, not silently persisted.
-
-### Graceful Degradation
-
-Without embedding models, the MCP server hides vector-dependent tools entirely:
-
-| Mode | Tools Exposed |
-|------|--------------|
-| **With models** | search, vector_search, deep_search, research, get, multi_get, status |
-| **Without models** | search, get, multi_get, status |
-
-The agent never sees tools it can't use. Instructions update to explain BM25-only mode. All new features (`maxChars`, `note`, stale flagging) work in both modes.
+- **Robust FTS5 queries** — version strings (`v3.9.7`), hyphenated terms (`real-time`), and operator words (AND/OR/NOT) can no longer produce FTS5 syntax errors; every term is emitted as a quoted phrase with prefix matching.
+- **Real document retrieval** — `get`/`multi_get` return content from disk with line-numbered output, `qmd://` + `#docid` headers, and line-range refs: `get notes.md:120:40` reads 40 lines from line 120. `--full-path` swaps in the on-disk path for piping into editors and file tools.
+- **BM25 snippets with line citations** — snippets are extracted from the source file (`>>>term<<<` highlighting, `path:L<n>`), which also feeds the reranker real text instead of bare titles.
+- **Embedding fingerprints** — vectors are stamped with the model + chunker identity; changing either marks documents pending for re-embed instead of silently searching stale vectors.
+- **Honest embed tracking** — a document only counts as embedded when *every* chunk has a current vector; interrupted embed runs resume instead of being forgotten.
+- **Concurrency-safe SQLite** — 120s busy timeout (override: `PICOQMD_SQLITE_BUSY_TIMEOUT`, ms) so a scheduled sync racing the MCP daemon queues instead of throwing `database is locked`.
+- **Scoped embedding** — `picoqmd embed -c <collection>` embeds one collection without re-indexing, so huge collections are opt-in.
+- **`--no-rerank`** — skip the cross-encoder for faster hybrid results on constrained hardware.
+- **First test suite** — `go test ./...` covers query sanitization, retrieval, and embed tracking against a real store.
 
 ## Quick Start
 
 ```sh
-# Install
+# Install (or grab a prebuilt binary from Releases)
 go install github.com/altSeneca/picoqmd@latest
 
 # Index markdown docs (default)
@@ -111,6 +69,9 @@ picoqmd add ~/myproject --glob "**/*.{go,py,ts,md}" --no-embed
 # Search — prefix matching built in
 picoqmd search "kubernetes deployment"
 picoqmd search "deploy"          # matches "deployment", "deployed", "deploying"
+
+# Retrieve with line ranges
+picoqmd get notes.md:120:40      # 40 lines starting at line 120
 ```
 
 ## MCP Server
@@ -150,24 +111,27 @@ Any agent that speaks [Model Context Protocol](https://modelcontextprotocol.io/)
 
 | Tool | Description | Requires Models |
 |------|-------------|----------------|
-| `search` | BM25 keyword search via SQLite FTS5 with prefix matching | No |
+| `search` | BM25 keyword search via SQLite FTS5 with prefix matching, disk-extracted snippets, line citations | No |
 | `vector_search` | Semantic similarity using embeddings | Yes |
-| `deep_search` | Query expansion + fan-out + RRF + re-ranking | Yes |
-| `research` | Composite: BM25 + vector in parallel, deduplicated via RRF | Yes |
-| `get` | Retrieve single document by path or docid | No |
-| `multi_get` | Batch retrieve by glob pattern or comma-separated list | No |
-| `status` | Index health, collection inventory, stale observation count | No |
+| `deep_search` | Query expansion + fan-out + RRF + re-ranking (`noExpand`, `noRerank` to trim stages) | Yes |
+| `research` | Composite: BM25 + vector in parallel, deduplicated via RRF, one call | Yes |
+| `get` | Retrieve a document by path, `#docid`, or `qmd://` URI, with `:from:count` line ranges, line-numbered | No |
+| `multi_get` | Batch retrieve by glob or comma-separated list; oversized files reported as skipped, never silently dropped | No |
+| `status` | Index health, embedding fingerprint, pending counts, stale observation count | No |
 
 **Common parameters** across search tools:
 
 | Parameter | Type | Description |
 |-----------|------|-------------|
 | `query` | string | Search query (required) |
+| `intent` | string | Optional disambiguation hint threaded through expansion, reranking, and snippets |
 | `limit` | int | Max results, default 10 |
 | `collection` | string | Filter to a specific collection |
-| `minScore` | float | Minimum relevance score 0-1 |
-| `maxChars` | int | Truncate response to this many characters |
+| `minScore` | float | Minimum relevance score 0–1 |
+| `maxChars` | int | Truncate response to this many characters (server-side token budget) |
 | `note` | string | Save an observation linked to the top result |
+
+**`get` / `multi_get` parameters:** `fromLine`, `maxLines`, `lineNumbers` (default true), `fullPath`, `maxBytes` (multi_get skip threshold, default 64KB).
 
 ## Two Modes
 
@@ -179,23 +143,24 @@ picoqmd add ~/src --glob "**/*.{go,py,rs,ts,js}" --no-embed
 picoqmd search "meeting notes"
 ```
 
-No models, no llama.cpp, no downloads. Just Go + SQLite FTS5 with prefix matching. This is the mode for PicoClaw-class devices where every megabyte counts. The binary is ~11MB, runtime memory is minimal, and search is instant.
+No models, no llama.cpp, no downloads. Just Go + SQLite FTS5 with prefix matching. This is the mode for Pi-Zero-class devices where every megabyte counts: keyword search over ~10,000 documents runs in under 30MB of RAM.
 
 ### Vector + Hybrid — For Capable Hardware
 
 ```sh
-picoqmd add ~/notes                  # downloads embedding model (~300MB)
-picoqmd model download               # all 3 models for full hybrid pipeline
-picoqmd "semantic search query"      # auto-selects best pipeline
+picoqmd add ~/notes                    # downloads embedding model (~300MB)
+picoqmd model download embedding       # or: reranker, expansion
+picoqmd "semantic search query"        # auto-selects best pipeline
+picoqmd embed -c big-collection        # embed one collection at a time
 ```
 
-When you have the RAM, unlock semantic search with query expansion, RRF fusion, and cross-encoder re-ranking — all still local, all still offline.
+When you have the RAM, unlock semantic search with query expansion, RRF fusion, and cross-encoder re-ranking — all still local, all still offline. Same models QMD uses:
 
 | Model | Size | Purpose |
 |-------|------|---------|
-| [embeddinggemma-300M](https://huggingface.co/tobi/embeddinggemma-300M-GGUF) | ~300MB | Document & query embeddings |
-| [qwen3-reranker-0.6b](https://huggingface.co/tobi/qwen3-reranker-0.6b-GGUF) | ~600MB | Cross-encoder re-ranking |
-| [qmd-query-expansion-1.7B](https://huggingface.co/tobi/qmd-query-expansion-GGUF) | ~1GB | Query expansion |
+| [embeddinggemma-300M](https://huggingface.co/ggml-org/embeddinggemma-300M-GGUF) | ~300MB | Document & query embeddings |
+| [qwen3-reranker-0.6b](https://huggingface.co/ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF) | ~600MB | Cross-encoder re-ranking |
+| [qmd-query-expansion-1.7B](https://huggingface.co/tobil/qmd-query-expansion-1.7B-gguf) | ~1GB | Query expansion |
 
 ## Search Modes
 
@@ -203,7 +168,7 @@ When you have the RAM, unlock semantic search with query expansion, RRF fusion, 
 |------|---------|--------------|
 | BM25 | `picoqmd search "query"` | Instant keyword search via SQLite FTS5 with prefix matching |
 | Vector | `picoqmd vsearch "query"` | Semantic similarity using embeddings |
-| Hybrid | `picoqmd query "query"` | Expansion + fan-out + RRF + re-ranking |
+| Hybrid | `picoqmd query "query"` | Expansion + fan-out + RRF + re-ranking (`--no-expand`, `--no-rerank` to trim) |
 | Smart | `picoqmd "query"` | Auto-selects best pipeline for available models |
 
 ## Platform Support
@@ -264,12 +229,17 @@ PicoQMD automatically skips binary files, files over 1MB, and common noise direc
 
 ## Use Cases
 
+- **QMD alternative on low-spec hardware** — same local hybrid search without the Node.js runtime, on machines from a Pi Zero up
+- **Claude Code MCP server** — fast, token-efficient search over large codebases without spinning up Elasticsearch
 - **PicoClaw / MiniClaw search tool** — give your $10 AI agent fast local search over project docs, wikis, and codebases
 - **OpenClaw on Raspberry Pi** — add document search to your self-hosted AI assistant without eating its RAM budget
-- **Claude Code MCP server** — fast, local search over large codebases without spinning up Elasticsearch
 - **Edge AI knowledge base** — deploy searchable documentation to field devices, kiosks, or air-gapped environments
 - **Offline dev search** — index API docs, READMEs, and notes for airplane-mode development
 - **Token-efficient MCP pipelines** — use `research` to cut context window usage by ~50% vs separate search calls
+
+## Roadmap
+
+See [ROADMAP.md](ROADMAP.md) — next up: Matryoshka 768→256 embedding truncation (3× smaller/faster vectors), chunk-level incremental re-embedding, recency-aware ranking, binary quantization with two-phase rescoring for very large corpora, and tree-sitter AST chunking for code.
 
 ## Acknowledgments
 

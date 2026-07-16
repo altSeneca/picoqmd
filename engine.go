@@ -65,19 +65,19 @@ var defaultModels = []ModelSpec{
 	{
 		Name:     "embedding",
 		Filename: "embeddinggemma-300M-Q8_0.gguf",
-		URL:      "https://huggingface.co/tobi/embeddinggemma-300M-GGUF/resolve/main/embeddinggemma-300M-Q8_0.gguf",
+		URL:      "https://huggingface.co/ggml-org/embeddinggemma-300M-GGUF/resolve/main/embeddinggemma-300M-Q8_0.gguf",
 		Purpose:  "Document and query embeddings",
 	},
 	{
 		Name:     "reranker",
 		Filename: "qwen3-reranker-0.6b-q8_0.gguf",
-		URL:      "https://huggingface.co/tobi/qwen3-reranker-0.6b-GGUF/resolve/main/qwen3-reranker-0.6b-q8_0.gguf",
+		URL:      "https://huggingface.co/ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF/resolve/main/qwen3-reranker-0.6b-q8_0.gguf",
 		Purpose:  "Cross-encoder re-ranking",
 	},
 	{
 		Name:     "expansion",
 		Filename: "qmd-query-expansion-1.7B-q4_k_m.gguf",
-		URL:      "https://huggingface.co/tobi/qmd-query-expansion-GGUF/resolve/main/qmd-query-expansion-1.7B-q4_k_m.gguf",
+		URL:      "https://huggingface.co/tobil/qmd-query-expansion-1.7B-gguf/resolve/main/qmd-query-expansion-1.7B-q4_k_m.gguf",
 		Purpose:  "Fine-tuned query expansion",
 	},
 }
