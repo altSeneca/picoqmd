@@ -893,10 +893,27 @@ func extractLibsFromTarGz(tgzPath, destDir string) error {
 			return fmt.Errorf("tar: %w", err)
 		}
 		name := filepath.Base(hdr.Name)
-		if !strings.HasSuffix(name, libExt) {
+		if !strings.Contains(name, libExt) {
 			continue
 		}
 		destPath := filepath.Join(destDir, name)
+
+		// llama.cpp releases ship version chains as symlinks
+		// (libggml.dylib -> libggml.0.9.7.dylib). Symlink entries have no
+		// body — writing them as regular files produces 0-byte dylibs that
+		// dlopen rejects. Recreate them as symlinks; everything lands flat
+		// in destDir so the target basename is the correct link.
+		if hdr.Typeflag == tar.TypeSymlink || hdr.Typeflag == tar.TypeLink {
+			os.Remove(destPath)
+			if err := os.Symlink(filepath.Base(hdr.Linkname), destPath); err != nil {
+				return fmt.Errorf("symlink %s: %w", name, err)
+			}
+			extracted++
+			continue
+		}
+		if hdr.Typeflag != tar.TypeReg {
+			continue
+		}
 		out, err := os.Create(destPath)
 		if err != nil {
 			return fmt.Errorf("create %s: %w", destPath, err)
@@ -920,9 +937,11 @@ func extractLibsFromTarGz(tgzPath, destDir string) error {
 // Embedding orchestration
 // ---------------------------------------------------------------------------
 
-func embedAll(store *Store) error {
+// embedAll embeds every pending document, or only those in `collection`
+// when non-empty.
+func embedAll(store *Store, collection string) error {
 	fp := embedFingerprint()
-	total, err := store.CountUnembedded(fp)
+	total, err := store.CountUnembedded(fp, collection)
 	if err != nil {
 		return err
 	}
@@ -951,7 +970,7 @@ func embedAll(store *Store) error {
 
 	const batchSize = 500
 	for {
-		remaining, err := store.CountUnembedded(fp)
+		remaining, err := store.CountUnembedded(fp, collection)
 		if err != nil {
 			return err
 		}
@@ -960,6 +979,9 @@ func embedAll(store *Store) error {
 		}
 
 		args := []string{"embed-worker", "--batch", strconv.Itoa(batchSize)}
+		if collection != "" {
+			args = append(args, "--collection", collection)
+		}
 		if quiet {
 			args = append(args, "--quiet")
 		}
@@ -969,7 +991,10 @@ func embedAll(store *Store) error {
 		cmd.Env = os.Environ()
 
 		err = cmd.Run()
-		newRemaining, countErr := store.CountUnembedded(fp)
+		if ee, ok := err.(*exec.ExitError); ok && ee.ExitCode() == embedEngineUnavailableExit {
+			return fmt.Errorf("embedding engine unavailable — aborting instead of skipping documents (check 'picoqmd model list' and the llama.cpp lib in the cache dir)")
+		}
+		newRemaining, countErr := store.CountUnembedded(fp, collection)
 		if countErr != nil {
 			return countErr
 		}
@@ -998,7 +1023,7 @@ func embedAll(store *Store) error {
 	return nil
 }
 
-func embedWorker(maxDocs int) error {
+func embedWorker(maxDocs int, collection string) error {
 	cfg, _, err := loadConfig("")
 	if err != nil {
 		return err
@@ -1012,8 +1037,16 @@ func embedWorker(maxDocs int) error {
 	engine := NewLLMEngine(cacheDir())
 	defer engine.Close()
 
+	// Probe the engine before touching any documents: a chronic failure
+	// (missing or corrupt llama.cpp lib, missing model) must abort the run
+	// instead of letting the orchestrator mark every document as skipped.
+	if _, err := engine.Embed("startup probe", true); err != nil {
+		fmt.Fprintf(os.Stderr, "embedding engine unavailable: %v\n", err)
+		os.Exit(embedEngineUnavailableExit)
+	}
+
 	fp := embedFingerprint()
-	hashes, err := store.UnembeddedHashes(fp)
+	hashes, err := store.UnembeddedHashes(fp, collection)
 	if err != nil {
 		return err
 	}
@@ -1109,5 +1142,5 @@ func syncAll(store *Store, engine Embedder, cfg *Config, skipEmbed bool) error {
 	if skipEmbed {
 		return nil
 	}
-	return embedAll(store)
+	return embedAll(store, "")
 }

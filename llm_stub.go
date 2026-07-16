@@ -152,7 +152,11 @@ func (s *BM25OnlySearcher) Search(ctx context.Context, query, intent, collection
 // Stub functions
 // ---------------------------------------------------------------------------
 
-func embedWorker(maxDocs int) error {
+func embedWorker(maxDocs int, collection string) error {
+	return fmt.Errorf("embedding not supported on this platform (requires amd64 or arm64)")
+}
+
+func embedAll(store *Store, collection string) error {
 	return fmt.Errorf("embedding not supported on this platform (requires amd64 or arm64)")
 }
 

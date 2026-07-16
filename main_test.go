@@ -249,7 +249,7 @@ func TestPendingEmbedTracking(t *testing.T) {
 
 	assertPending := func(want int, msg string) {
 		t.Helper()
-		n, err := store.CountUnembedded(fp)
+		n, err := store.CountUnembedded(fp, "")
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -283,7 +283,7 @@ func TestPendingEmbedTracking(t *testing.T) {
 	assertPending(0, "fully embedded")
 
 	// A different fingerprint (model/chunker change) marks it stale again.
-	if n, err := store.CountUnembedded("other-model|cv9"); err != nil || n != 1 {
+	if n, err := store.CountUnembedded("other-model|cv9", ""); err != nil || n != 1 {
 		t.Errorf("stale fingerprint not detected: n=%d err=%v", n, err)
 	}
 	stale, err := store.HasStaleFP(hash, "other-model|cv9")
@@ -317,7 +317,7 @@ func TestSkipNextUnembeddedProgresses(t *testing.T) {
 	if err := store.SkipNextUnembedded(); err != nil {
 		t.Fatal(err)
 	}
-	if n, _ := store.CountUnembedded(fp); n != 0 {
+	if n, _ := store.CountUnembedded(fp, ""); n != 0 {
 		t.Errorf("skip did not clear chunkless doc: pending=%d", n)
 	}
 
@@ -334,7 +334,7 @@ func TestSkipNextUnembeddedProgresses(t *testing.T) {
 	if err := store.SkipNextUnembedded(); err != nil {
 		t.Fatal(err)
 	}
-	if n, _ := store.CountUnembedded(fp); n != 0 {
+	if n, _ := store.CountUnembedded(fp, ""); n != 0 {
 		t.Errorf("skip did not clear partially embedded doc: pending=%d", n)
 	}
 }

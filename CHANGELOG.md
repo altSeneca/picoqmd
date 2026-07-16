@@ -61,6 +61,24 @@ own retrieval path found while porting. First release with a test suite
   comma-separated patterns are deduped. (qmd #701, #702)
 - **`--no-rerank` / `noRerank`.** Skips the LLM reranking stage and returns
   RRF-fused order — pairs with the existing `--no-expand`. (qmd #370)
+- **`picoqmd embed -c <collection>`** embeds one collection's pending
+  documents without re-indexing everything — makes huge collections
+  (books-*) opt-in instead of all-or-nothing. (qmd v2.5.0 scoped embed)
+
+### Fixed (post-review, found during rollout)
+
+- **llama.cpp runtime extraction produced 0-byte dylibs.** The release
+  tarball ships version chains (`libggml.dylib → libggml.0.9.7.dylib`) as
+  symlinks; the extractor wrote symlink entries as regular files via
+  `os.Create` + `io.Copy` (no body → empty file), so dlopen always failed.
+  This is why **no vector had ever been successfully embedded** by picoqmd
+  on this machine (all 9,390 chunk rows had NULL vectors). Symlinks are now
+  recreated as symlinks; Linux versioned `.so.X.Y` names are matched too.
+- **Chronic engine failure no longer poisons the index.** When the engine
+  couldn't initialize at all, the orchestrator's skip loop marked every
+  pending document as "skipped" with dummy vectors — silently destroying
+  the pending queue. The embed worker now probes the engine at startup and
+  exits with a distinct code; the orchestrator aborts with a clear error.
 
 ### Notes
 

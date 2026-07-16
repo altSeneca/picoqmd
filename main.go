@@ -63,7 +63,13 @@ const (
 
 	// chunkerVersion is folded into the embedding fingerprint. Bump it when
 	// ChunkDocument's output changes so existing vectors re-embed.
-	chunkerVersion    = "cv1"
+	chunkerVersion = "cv1"
+
+	// embedEngineUnavailableExit is the embed-worker exit code for "the
+	// embedding engine cannot initialize at all" — the orchestrator aborts
+	// rather than skip-looping through every pending document.
+	embedEngineUnavailableExit = 3
+
 	rrfK              = 60      // RRF fusion constant
 	maxRerank         = 30      // candidates sent to reranker
 	maxIndexFileBytes = 1 << 20 // 1 MB file size limit for indexing
@@ -1069,16 +1075,19 @@ func renderDocument(doc *Document, from, count int, lineNumbers, fullPath bool) 
 // under a different model/chunker fingerprint. A document only counts as
 // embedded when every chunk has a current vector — partial coverage from an
 // interrupted run stays pending and resumes on the next embed.
+// ?1 is a collection name (” = all collections), ?2 the current fingerprint.
 const pendingHashCond = `
 	d.active = 1
+	AND (?1 = '' OR d.col_id IN (SELECT id FROM collections WHERE name = ?1))
 	AND (
 		NOT EXISTS (SELECT 1 FROM content_vectors v WHERE v.hash = d.hash)
-		OR EXISTS (SELECT 1 FROM content_vectors v WHERE v.hash = d.hash AND (v.vec IS NULL OR v.fp <> ?))
+		OR EXISTS (SELECT 1 FROM content_vectors v WHERE v.hash = d.hash AND (v.vec IS NULL OR v.fp <> ?2))
 	)`
 
 // UnembeddedHashes returns content hashes whose embeddings are missing,
-// incomplete, or stale relative to the given fingerprint.
-func (s *Store) UnembeddedHashes(fp string) ([]string, error) {
+// incomplete, or stale relative to the given fingerprint. collection scopes
+// to one collection; "" means all.
+func (s *Store) UnembeddedHashes(fp, collection string) ([]string, error) {
 	conn, err := s.pool.Take(context.Background())
 	if err != nil {
 		return nil, err
@@ -1089,7 +1098,7 @@ func (s *Store) UnembeddedHashes(fp string) ([]string, error) {
 	err = sqlitex.Execute(conn,
 		`SELECT DISTINCT d.hash FROM documents d WHERE `+pendingHashCond,
 		&sqlitex.ExecOptions{
-			Args: []any{fp},
+			Args: []any{collection, fp},
 			ResultFunc: func(stmt *sqlite.Stmt) error {
 				hashes = append(hashes, stmt.ColumnText(0))
 				return nil
@@ -1100,7 +1109,8 @@ func (s *Store) UnembeddedHashes(fp string) ([]string, error) {
 
 // CountUnembedded returns the number of active documents whose embeddings
 // are missing, incomplete, or stale relative to the given fingerprint.
-func (s *Store) CountUnembedded(fp string) (int, error) {
+// collection scopes to one collection; "" means all.
+func (s *Store) CountUnembedded(fp, collection string) (int, error) {
 	conn, err := s.pool.Take(context.Background())
 	if err != nil {
 		return 0, err
@@ -1111,7 +1121,7 @@ func (s *Store) CountUnembedded(fp string) (int, error) {
 	err = sqlitex.Execute(conn,
 		`SELECT COUNT(DISTINCT d.hash) FROM documents d WHERE `+pendingHashCond,
 		&sqlitex.ExecOptions{
-			Args: []any{fp},
+			Args: []any{collection, fp},
 			ResultFunc: func(stmt *sqlite.Stmt) error {
 				count = stmt.ColumnInt(0)
 				return nil
@@ -1134,7 +1144,7 @@ func (s *Store) SkipNextUnembedded() error {
 	err = sqlitex.Execute(conn,
 		`SELECT DISTINCT d.hash FROM documents d WHERE `+pendingHashCond+` LIMIT 1`,
 		&sqlitex.ExecOptions{
-			Args: []any{fp},
+			Args: []any{"", fp},
 			ResultFunc: func(stmt *sqlite.Stmt) error {
 				hash = stmt.ColumnText(0)
 				return nil
@@ -1957,7 +1967,7 @@ func (m *MCPServer) callTool(params json.RawMessage) (any, error) {
 
 	case "status":
 		cols, docs, chunks, _ := m.store.Stats()
-		pending, _ := m.store.CountUnembedded(embedFingerprint())
+		pending, _ := m.store.CountUnembedded(embedFingerprint(), "")
 		stale := getStaleObservations(m.observationsPath(), m.store)
 		return toolResult(map[string]any{
 			"collections":       cols,
@@ -2924,10 +2934,22 @@ Quick start:
 
 	embedCmd := &cobra.Command{
 		Use:   "embed",
-		Short: "Generate embeddings (alias for sync)",
-		RunE:  syncRunE,
+		Short: "Generate embeddings (alias for sync; -c embeds one collection without re-indexing)",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			col, _ := cmd.Flags().GetString("collection")
+			if col == "" {
+				return syncRunE(cmd, args)
+			}
+			store, err := NewStore(dbPath(indexName))
+			if err != nil {
+				return err
+			}
+			defer store.Close()
+			return embedAll(store, col)
+		},
 	}
 	embedCmd.Flags().Bool("no-embed", false, "skip embedding (BM25-only re-index)")
+	embedCmd.Flags().StringP("collection", "c", "", "embed only this collection's pending documents (skips re-indexing)")
 
 	// --- collection add (backward compat) ---
 	collectionCmd := &cobra.Command{Use: "collection", Short: "Manage document collections"}
@@ -3097,7 +3119,7 @@ Quick start:
 			defer store.Close()
 
 			cols, docs, chunks, _ := store.Stats()
-			pending, _ := store.CountUnembedded(embedFingerprint())
+			pending, _ := store.CountUnembedded(embedFingerprint(), "")
 			fmt.Printf("collections: %d\ndocuments:   %d\nchunks:      %d\npending:     %d docs need (re-)embedding\nfingerprint: %s\ndatabase:    %s\n",
 				cols, docs, chunks, pending, embedFingerprint(), dbPath(indexName))
 			return nil
@@ -3193,15 +3215,17 @@ Quick start:
 
 	// --- embed-worker (hidden, used by subprocess orchestrator) ---
 	var workerBatch int
+	var workerCollection string
 	embedWorkerCmd := &cobra.Command{
 		Use:    "embed-worker",
 		Short:  "Internal: embed a batch of documents (used by sync subprocess orchestrator)",
 		Hidden: true,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return embedWorker(workerBatch)
+			return embedWorker(workerBatch, workerCollection)
 		},
 	}
 	embedWorkerCmd.Flags().IntVar(&workerBatch, "batch", 500, "max documents to embed")
+	embedWorkerCmd.Flags().StringVar(&workerCollection, "collection", "", "restrict to one collection")
 
 	// --- export ---
 	exportCmd := &cobra.Command{
