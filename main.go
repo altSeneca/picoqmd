@@ -55,7 +55,7 @@ import (
 // ---------------------------------------------------------------------------
 
 const (
-	version       = "0.4.2"
+	version       = "0.5.0"
 	defaultDB     = "index.sqlite"
 	chunkTarget   = 900 // target tokens per chunk
 	chunkLookback = 200 // tokens to look back for break points
@@ -624,6 +624,34 @@ func (s *Store) ActiveCollectionNames() ([]string, error) {
 	return names, err
 }
 
+// parseScope splits a collection scope string ("a" or "a,b,c") into names.
+// Empty string means "no scope" (all collections).
+func parseScope(scope string) []string {
+	var names []string
+	for _, n := range strings.Split(scope, ",") {
+		if n = strings.TrimSpace(n); n != "" {
+			names = append(names, n)
+		}
+	}
+	return names
+}
+
+// SearchBM25Scoped resolves a collection scope: "" searches all collections
+// (per-collection RRF), a single name searches that collection, and a
+// comma-separated list searches each listed collection separately and fuses
+// via RRF — so unrelated result sets can't crowd each other out. (qmd 2.8.3)
+func (s *Store) SearchBM25Scoped(query, scope string, limit int) ([]SearchResult, error) {
+	names := parseScope(scope)
+	switch len(names) {
+	case 0:
+		return s.SearchBM25Normalized(query, limit)
+	case 1:
+		return s.searchBM25(query, names[0], limit)
+	default:
+		return s.searchBM25RRF(query, names, limit)
+	}
+}
+
 // SearchBM25Normalized runs BM25 per-collection and fuses via RRF so small
 // collections get fair representation against large ones.
 func (s *Store) SearchBM25Normalized(query string, limit int) ([]SearchResult, error) {
@@ -632,7 +660,12 @@ func (s *Store) SearchBM25Normalized(query string, limit int) ([]SearchResult, e
 		// Single collection or error — fall back to normal search
 		return s.SearchBM25(query, limit)
 	}
+	return s.searchBM25RRF(query, names, limit)
+}
 
+// searchBM25RRF searches each named collection separately and fuses the
+// ranked lists with reciprocal rank fusion.
+func (s *Store) searchBM25RRF(query string, names []string, limit int) ([]SearchResult, error) {
 	// Run per-collection searches
 	type rankedList struct {
 		results []SearchResult
@@ -699,6 +732,14 @@ func (s *Store) SearchVectorInCollection(query string, queryVec []float32, colle
 	return s.searchVector(query, queryVec, collection, limit)
 }
 
+// SearchVectorScoped resolves a collection scope: "" = all collections, a
+// single name = that collection, a comma-separated list = those collections.
+// Cosine scores are directly comparable across collections, so the multi
+// case is a single filtered scan — no fusion needed.
+func (s *Store) SearchVectorScoped(query string, queryVec []float32, scope string, limit int) ([]SearchResult, error) {
+	return s.searchVector(query, queryVec, scope, limit)
+}
+
 func (s *Store) searchVector(query string, queryVec []float32, collection string, limit int) ([]SearchResult, error) {
 	conn, err := s.pool.Take(context.Background())
 	if err != nil {
@@ -706,16 +747,23 @@ func (s *Store) searchVector(query string, queryVec []float32, collection string
 	}
 	defer s.pool.Put(conn)
 
-	// Build set of hashes belonging to the collection (if filtered)
+	// Build set of hashes belonging to the scoped collection(s), if filtered.
+	// `collection` may be a single name or a comma-separated list.
 	var collectionHashes map[string]bool
-	if collection != "" {
+	if names := parseScope(collection); len(names) > 0 {
 		collectionHashes = make(map[string]bool)
+		placeholders := strings.Repeat("?,", len(names))
+		placeholders = placeholders[:len(placeholders)-1]
+		args := make([]any, len(names))
+		for i, n := range names {
+			args[i] = n
+		}
 		err = sqlitex.Execute(conn, `
 			SELECT DISTINCT d.hash FROM documents d
 			JOIN collections c ON c.id = d.col_id
-			WHERE c.name = ? AND d.active = 1`,
+			WHERE c.name IN (`+placeholders+`) AND d.active = 1`,
 			&sqlitex.ExecOptions{
-				Args: []any{collection},
+				Args: args,
 				ResultFunc: func(stmt *sqlite.Stmt) error {
 					collectionHashes[stmt.ColumnText(0)] = true
 					return nil
@@ -1687,7 +1735,7 @@ func (m *MCPServer) toolDefinitions() []map[string]any {
 		"query":      map[string]any{"type": "string", "description": "Search query"},
 		"intent":     map[string]any{"type": "string", "description": intentDesc},
 		"limit":      map[string]any{"type": "integer", "description": "Max results (default 10)"},
-		"collection": map[string]any{"type": "string", "description": "Filter to a specific collection"},
+		"collection": map[string]any{"type": "string", "description": "Filter to a collection, or a comma-separated list (e.g. \"shared-src,ios-src\") to search several and merge without crowding"},
 		"minScore":   map[string]any{"type": "number", "description": "Minimum score threshold (default 0)"},
 		"maxChars":   map[string]any{"type": "integer", "description": "Truncate total response to this many characters (server-side token budget)"},
 		"note":       map[string]any{"type": "string", "description": "Save an observation linked to the top result (persisted across sessions, auto-flagged stale when source changes)"},
@@ -1706,7 +1754,7 @@ func (m *MCPServer) toolDefinitions() []map[string]any {
 				"query":      map[string]any{"type": "string", "description": "Search query"},
 				"intent":     map[string]any{"type": "string", "description": intentDesc},
 				"limit":      map[string]any{"type": "integer", "description": "Max results (default 10)"},
-				"collection": map[string]any{"type": "string", "description": "Filter to a specific collection"},
+				"collection": map[string]any{"type": "string", "description": "Filter to a collection, or a comma-separated list (e.g. \"shared-src,ios-src\") to search several and merge without crowding"},
 				"minScore":   map[string]any{"type": "number", "description": "Minimum score threshold (default 0.3)"},
 				"maxChars":   map[string]any{"type": "integer", "description": "Truncate total response to this many characters"},
 				"note":       map[string]any{"type": "string", "description": "Save an observation linked to the top result"},
@@ -1717,7 +1765,7 @@ func (m *MCPServer) toolDefinitions() []map[string]any {
 				"query":      map[string]any{"type": "string", "description": "Search query"},
 				"intent":     map[string]any{"type": "string", "description": intentDesc},
 				"limit":      map[string]any{"type": "integer", "description": "Max results (default 10)"},
-				"collection": map[string]any{"type": "string", "description": "Filter to a specific collection"},
+				"collection": map[string]any{"type": "string", "description": "Filter to a collection, or a comma-separated list (e.g. \"shared-src,ios-src\") to search several and merge without crowding"},
 				"minScore":   map[string]any{"type": "number", "description": "Minimum score threshold (default 0)"},
 				"maxChars":   map[string]any{"type": "integer", "description": "Truncate total response to this many characters (server-side token budget)"},
 				"note":       map[string]any{"type": "string", "description": "Save an observation linked to the top result (persisted across sessions, auto-flagged stale when source changes)"},
@@ -1730,7 +1778,7 @@ func (m *MCPServer) toolDefinitions() []map[string]any {
 				"query":      map[string]any{"type": "string", "description": "Search query"},
 				"intent":     map[string]any{"type": "string", "description": intentDesc},
 				"limit":      map[string]any{"type": "integer", "description": "Max results (default 10)"},
-				"collection": map[string]any{"type": "string", "description": "Filter to a specific collection"},
+				"collection": map[string]any{"type": "string", "description": "Filter to a collection, or a comma-separated list (e.g. \"shared-src,ios-src\") to search several and merge without crowding"},
 				"minScore":   map[string]any{"type": "number", "description": "Minimum score threshold (default 0)"},
 				"maxChars":   map[string]any{"type": "integer", "description": "Truncate total response to this many characters (default: no limit)"},
 				"note":       map[string]any{"type": "string", "description": "Save an observation linked to the top result"},
@@ -1848,13 +1896,7 @@ func (m *MCPServer) callTool(params json.RawMessage) (any, error) {
 
 	switch call.Name {
 	case "search":
-		var results []SearchResult
-		var err error
-		if args.Collection != "" {
-			results, err = m.store.SearchBM25InCollection(args.Query, args.Collection, args.Limit)
-		} else {
-			results, err = m.store.SearchBM25Normalized(args.Query, args.Limit)
-		}
+		results, err := m.store.SearchBM25Scoped(args.Query, args.Collection, args.Limit)
 		if err != nil {
 			return nil, err
 		}
@@ -1868,12 +1910,7 @@ func (m *MCPServer) callTool(params json.RawMessage) (any, error) {
 			return nil, err
 		}
 		snippetText := combineForSnippet(args.Query, args.Intent)
-		var results []SearchResult
-		if args.Collection != "" {
-			results, err = m.store.SearchVectorInCollection(snippetText, qvec, args.Collection, args.Limit)
-		} else {
-			results, err = m.store.SearchVector(snippetText, qvec, args.Limit)
-		}
+		results, err := m.store.SearchVectorScoped(snippetText, qvec, args.Collection, args.Limit)
 		if err != nil {
 			return nil, err
 		}
@@ -1902,20 +1939,11 @@ func (m *MCPServer) callTool(params json.RawMessage) (any, error) {
 
 	case "research":
 		// Composite: BM25 + vector search, deduplicated via RRF
-		var bm25Results []SearchResult
-		if args.Collection != "" {
-			bm25Results, _ = m.store.SearchBM25InCollection(args.Query, args.Collection, args.Limit*2)
-		} else {
-			bm25Results, _ = m.store.SearchBM25Normalized(args.Query, args.Limit*2)
-		}
+		bm25Results, _ := m.store.SearchBM25Scoped(args.Query, args.Collection, args.Limit*2)
 		var vecResults []SearchResult
 		if qvec, err := m.engine.Embed(args.Query, true); err == nil {
 			snippetText := combineForSnippet(args.Query, args.Intent)
-			if args.Collection != "" {
-				vecResults, _ = m.store.SearchVectorInCollection(snippetText, qvec, args.Collection, args.Limit*2)
-			} else {
-				vecResults, _ = m.store.SearchVector(snippetText, qvec, args.Limit*2)
-			}
+			vecResults, _ = m.store.SearchVectorScoped(snippetText, qvec, args.Collection, args.Limit*2)
 		}
 		merged := simpleRRF(bm25Results, vecResults, args.Limit)
 		filtered := filterMinScore(merged, args.MinScore)
@@ -2329,8 +2357,58 @@ func dbPath(indexName string) string {
 // vector. Vectors whose stored fingerprint differs are treated as pending so
 // a model or chunker change triggers re-embedding instead of silently
 // searching stale embeddings.
+//
+// The fingerprint includes a hash of the model FILE BYTES, not just its name:
+// on 2026-08-29 a re-downloaded GGUF with the same filename silently
+// invalidated every stored vector (searches returned cosine ~0.05 noise)
+// while the name-only fingerprint saw no change.
+var (
+	embedFPOnce   sync.Once
+	embedFPCached string
+)
+
 func embedFingerprint() string {
-	return defaultModels[0].Filename + "|" + chunkerVersion
+	embedFPOnce.Do(func() {
+		name := defaultModels[0].Filename
+		if h := modelFileHash(filepath.Join(cacheDir(), "models", name)); h != "" {
+			embedFPCached = name + "@" + h + "|" + chunkerVersion
+		} else {
+			// Model not downloaded (BM25-only install): legacy name-only
+			// form. Embedding requires the model, so no vector is ever
+			// written under this fallback.
+			embedFPCached = name + "|" + chunkerVersion
+		}
+	})
+	return embedFPCached
+}
+
+// modelFileHash returns the first 16 hex chars of the model file's sha256.
+// A sidecar cache (<model>.sha256: "size|mtime|hash") avoids re-hashing
+// ~300MB on every invocation; it is refreshed whenever size or mtime change.
+func modelFileHash(path string) string {
+	st, err := os.Stat(path)
+	if err != nil {
+		return ""
+	}
+	sidecar := path + ".sha256"
+	stamp := fmt.Sprintf("%d|%d|", st.Size(), st.ModTime().Unix())
+	if b, err := os.ReadFile(sidecar); err == nil {
+		if s := strings.TrimSpace(string(b)); strings.HasPrefix(s, stamp) {
+			return strings.TrimPrefix(s, stamp)
+		}
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return ""
+	}
+	defer f.Close()
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return ""
+	}
+	sum := hex.EncodeToString(h.Sum(nil))[:16]
+	os.WriteFile(sidecar, []byte(stamp+sum+"\n"), 0o644)
+	return sum
 }
 
 func contentHash(content string) string {
@@ -3029,7 +3107,12 @@ Quick start:
 			}
 			defer store.Close()
 
-			results, err := store.SearchBM25(query, limit)
+			var results []SearchResult
+			if col, _ := cmd.Flags().GetString("collection"); col != "" {
+				results, err = store.SearchBM25Scoped(query, col, limit)
+			} else {
+				results, err = store.SearchBM25(query, limit)
+			}
 			if err != nil {
 				return err
 			}
@@ -3038,6 +3121,7 @@ Quick start:
 	}
 	searchCmd.Flags().Int("limit", 10, "max results")
 	searchCmd.Flags().String("format", "text", "output: text, json, csv, md, files")
+	searchCmd.Flags().StringP("collection", "c", "", "collection name, or comma-separated list")
 
 	// --- vsearch (vector) ---
 	vsearchCmd := &cobra.Command{
@@ -3065,7 +3149,8 @@ Quick start:
 				return err
 			}
 
-			results, err := store.SearchVector(combineForSnippet(query, searchIntent), qvec, limit)
+			col, _ := cmd.Flags().GetString("collection")
+			results, err := store.SearchVectorScoped(combineForSnippet(query, searchIntent), qvec, col, limit)
 			if err != nil {
 				return err
 			}
@@ -3074,6 +3159,7 @@ Quick start:
 	}
 	vsearchCmd.Flags().Int("limit", 10, "max results")
 	vsearchCmd.Flags().String("format", "text", "output: text, json, csv, md, files")
+	vsearchCmd.Flags().StringP("collection", "c", "", "collection name, or comma-separated list")
 
 	// --- query (hybrid) ---
 	queryCmd := &cobra.Command{
@@ -3103,7 +3189,8 @@ Quick start:
 			if t, ok := hybrid.(interface{ SetNoRerank(bool) }); ok {
 				t.SetNoRerank(noRerank)
 			}
-			results, err := hybrid.Search(context.Background(), query, searchIntent, "", limit)
+			col, _ := cmd.Flags().GetString("collection")
+			results, err := hybrid.Search(context.Background(), query, searchIntent, col, limit)
 			if err != nil {
 				return err
 			}
@@ -3112,6 +3199,7 @@ Quick start:
 	}
 	queryCmd.Flags().Int("limit", 10, "max results")
 	queryCmd.Flags().String("format", "text", "output: text, json, csv, md, files")
+	queryCmd.Flags().StringP("collection", "c", "", "collection name, or comma-separated list")
 
 	// --- get ---
 	getCmd := &cobra.Command{
@@ -3395,7 +3483,10 @@ Quick start:
 		},
 	}
 
-	root.AddCommand(topAddCmd, syncCmd, collectionCmd, updateCmd, embedCmd, searchCmd, vsearchCmd, queryCmd, getCmd, statusCmd, mcpCmd, contextCmd, modelCmd, embedWorkerCmd, exportCmd, importCmd)
+	root.AddCommand(topAddCmd, syncCmd, collectionCmd, updateCmd, embedCmd, searchCmd, vsearchCmd, queryCmd, getCmd, statusCmd, mcpCmd, contextCmd, modelCmd, embedWorkerCmd, exportCmd, importCmd,
+		newDoctorCmd(func() string { return dbPath(indexName) }),
+		newCleanupCmd(func() string { return dbPath(indexName) }),
+		newBenchCmd(func() string { return dbPath(indexName) }))
 
 	if err := root.Execute(); err != nil {
 		os.Exit(1)

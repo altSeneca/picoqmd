@@ -1,0 +1,19 @@
+{
+  "k": 10,
+  "cases": [
+    {
+      "query": "how do I configure collections",
+      "expect": ["README", "GUIDE"]
+    },
+    {
+      "query": "reciprocal rank fusion hybrid search",
+      "intent": "understand how result lists are merged",
+      "expect": ["CHANGELOG", "ROADMAP"]
+    },
+    {
+      "query": "binary quantization roadmap",
+      "collection": "docs",
+      "expect": ["ROADMAP"]
+    }
+  ]
+}

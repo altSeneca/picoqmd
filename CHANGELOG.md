@@ -1,5 +1,53 @@
 # Changelog
 
+## [0.5.0] - 2026-08-29
+
+Five features ported from upstream qmd's 2.5.3→2.8.3 run, adapted to
+picoqmd's architecture.
+
+### Reliability
+
+- **Model-hash embedding fingerprints.** The fingerprint now includes a
+  sha256 of the embedding model's file BYTES (`name@<hash16>|cv1`), not just
+  its filename. Motivating incident (2026-08-29): a re-downloaded GGUF with
+  the same filename silently invalidated every stored vector — searches
+  returned cosine ~0.05 noise while the name-only fingerprint saw no change.
+  A sidecar cache (`<model>.sha256`, keyed on size+mtime) avoids re-hashing
+  ~300MB per invocation. Migration for an existing healthy index (vectors
+  embedded with the model currently on disk):
+  `UPDATE content_vectors SET fp='<new fp from doctor>' WHERE fp='embeddinggemma-300M-Q8_0.gguf|cv1';`
+  Without the migration the vectors count as pending and re-embed (correct,
+  just slower).
+- **`picoqmd doctor`** — reports model identity (size + hash), the current
+  fingerprint, per-fingerprint vector distribution with STALE flags, dummy /
+  pending counts, and orphaned vector rows. Exits 1 when problems are found
+  so launchd/CI can gate on it. Would have caught both the v0.4.1
+  dummy-vector poisoning and the incident above. (qmd `doctor`, 2.5.x)
+- **`picoqmd cleanup [--dry-run]`** — deletes stale-fingerprint and orphaned
+  vectors so the next `sync` regenerates them. (qmd 2.8.3)
+
+### Search quality
+
+- **Multi-collection scope.** Everywhere a collection is accepted (MCP
+  `collection` param, new CLI `-c/--collection` on `search`/`vsearch`/
+  `query`), a comma-separated list now works: each collection is searched
+  separately and the ranked lists are RRF-fused (BM25) or score-merged
+  (vector, cosine is cross-collection comparable) — so one big collection
+  can't crowd a small one out of the top-k. (qmd 2.8.3's multi-collection
+  fix, generalized from the existing `SearchBM25Normalized` machinery.)
+- **Intent-aware strong-signal bypass.** A dominant BM25 probe hit no longer
+  skips LLM query expansion when the caller supplied an `intent` — the
+  obvious keyword match may not match the intent. (qmd 2.1)
+
+### Tooling
+
+- **`picoqmd bench <fixture.json>`** — search-quality evaluation (hit@k,
+  precision@k, recall@k, MRR) per pipeline (bm25 / vector / research /
+  hybrid), with `--pipeline` and `--misses`. Fixture pins queries to
+  expected paths/docids; exists to measure the ROADMAP's Matryoshka-256 and
+  binary-quantization phases instead of eyeballing them. See
+  `example-bench.json`. (qmd `bench`, 2.1)
+
 ## [0.4.2] - 2026-07-16
 
 ### Performance

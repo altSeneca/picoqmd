@@ -1,58 +1,73 @@
-# PicoQMD — a lightweight QMD alternative for low-resource computers
+# PicoQMD: a lightweight QMD alternative for low-resource computers
 
 **A fully local search engine and MCP server in a single ~15MB Go binary.** PicoQMD is a from-scratch Go reimplementation of [tobi's QMD](https://github.com/tobi/qmd) built for machines where QMD's Node.js/Bun stack is too heavy: Raspberry Pi (including Pi Zero), old laptops, small VPSes, air-gapped boxes, and dev machines that just don't want another Node runtime.
 
-Same search pipeline as QMD — SQLite FTS5 BM25, semantic vector search, hybrid query expansion + Reciprocal Rank Fusion + cross-encoder reranking, the same GGUF models — with no Node.js, no Bun, no Python, no npm install, no native-module ABI headaches. One static binary and a SQLite file.
+It runs the same search pipeline as QMD (SQLite FTS5 BM25, semantic vector search, hybrid query expansion + Reciprocal Rank Fusion + cross-encoder reranking, the same GGUF models) without Node.js, Bun, Python, or native-module ABI headaches. One static binary and a SQLite file.
 
-Give any AI agent — [Claude Code](https://docs.anthropic.com/en/docs/claude-code), [OpenClaw](https://github.com/openinterface/openclaw), [PicoClaw](https://github.com/sipeed/picoclaw), [MiniClaw](https://github.com/mattdef/miniclaw), or your own — instant local search over code, docs, configs, and notes. No cloud, no telemetry, works offline.
+Point [Claude Code](https://docs.anthropic.com/en/docs/claude-code), [OpenClaw](https://github.com/openinterface/openclaw), [PicoClaw](https://github.com/sipeed/picoclaw), [MiniClaw](https://github.com/mattdef/miniclaw), or any other MCP agent at it for instant local search over code, docs, configs, and notes. No cloud, no telemetry, works offline.
 
 ## PicoQMD vs QMD
 
-If you're looking for **"QMD but for a lower-spec computer"**, this is the trade-off table:
+If you're looking for "QMD but for a lower-spec computer", this is the trade-off table:
 
 |  | QMD | PicoQMD |
 |--|-----|---------|
 | Install | Node.js/Bun + npm package (native modules: better-sqlite3, sqlite-vec, node-llama-cpp) | one static Go binary (~15MB) |
-| Runtime | Node/Bun VM | none — measured **~29MB peak RSS** for a BM25 search over a 10,800-doc index |
-| BM25 keyword search | SQLite FTS5 | SQLite FTS5 (pure-Go driver, contentless index — documents are not duplicated into the DB) |
+| Runtime | Node/Bun VM | none (measured **~29MB peak RSS** for a BM25 search over a 10,800-doc index) |
+| BM25 keyword search | SQLite FTS5 | SQLite FTS5 (pure-Go driver, contentless index; documents are not duplicated into the DB) |
 | Semantic vector search | sqlite-vec + node-llama-cpp | pure-Go brute-force cosine + llama.cpp via FFI (same EmbeddingGemma model) |
 | Hybrid pipeline | query expansion → fan-out → RRF → rerank | same design, same GGUF models |
 | MCP server | stdio + HTTP | stdio + HTTP |
 | Minimum hardware for keyword search | needs Node-capable box | Raspberry Pi Zero / ARM32 / RISC-V |
 | Vector/hybrid search | yes | yes, on arm64/amd64 (Linux, macOS) |
 | Line-numbered `get` with `:from:count` ranges | yes | yes (v0.4.0) |
-| Embedding fingerprints (stale-vector detection) | yes | yes (v0.4.0) |
+| Embedding fingerprints (stale-vector detection) | yes | yes; v0.5.0 hashes the model file's bytes, so a swapped model re-embeds instead of silently serving mismatched vectors |
+| Search-quality benchmarking | `qmd bench` | `picoqmd bench` (v0.5.0) |
+| Index diagnostics | `qmd doctor` | `picoqmd doctor` + `cleanup` (v0.5.0) |
 | AST/tree-sitter code chunking | yes | not yet ([roadmap](ROADMAP.md)) |
-| CJK trigram search | yes | no (kept out deliberately — doubles index size) |
+| CJK trigram search | yes | no (left out on purpose; it doubles the index) |
 
-PicoQMD is not a fork — it's an independent Go implementation that tracks QMD's retrieval design and ports its fixes (v0.4.0 covers the applicable QMD v2.1–v2.6.3 changes). If you have a beefy dev machine and live in the Node ecosystem, use QMD. If you want the same local search quality in a fraction of the footprint — or on hardware QMD can't run on at all — use PicoQMD.
+PicoQMD is not a fork. It's an independent Go implementation that tracks QMD's retrieval design and ports the fixes that apply (v0.4.0 covered QMD v2.1 to v2.6.3; v0.5.0 covers the v2.8.x round). If you have a fast dev machine and live in the Node ecosystem, use QMD. If you want the same local search quality in a fraction of the footprint, or on hardware QMD can't run at all, use PicoQMD.
 
 ## Why PicoQMD?
 
-Most search tools assume beefy hardware. PicoQMD is built for the other end of the spectrum:
+Most search tools assume fast hardware. PicoQMD is built for everything else:
 
-- **~15MB binary** (~11MB with `-ldflags="-s -w"`) — smaller than most npm installs
-- **Minimal RAM** — BM25 mode runs in tens of MB; fits alongside an agent on $10 hardware
-- **Zero dependencies** — no runtime, no interpreters, no containers, no C toolchain (pure-Go SQLite)
-- **MCP native** — stdio and HTTP transports, works with any MCP-compatible agent
-- **Cross-compiles anywhere Go does** — ARM32, ARM64, RISC-V, x86 in one command
-- **Scales up** — add semantic vector search and hybrid re-ranking when your hardware allows
-- **Graceful degradation** — without models, vector/hybrid tools are hidden from the agent; BM25, get, and observations still work
-- **Safe under launchd/cron/systemd** — auto-quiets progress output when stdout is not a TTY, so captured logs stay bounded
+- **~15MB binary** (~11MB with `-ldflags="-s -w"`), smaller than most npm installs
+- **Minimal RAM.** BM25 mode runs in tens of MB and fits alongside an agent on $10 hardware
+- **Zero dependencies.** No runtime, no interpreters, no containers, no C toolchain (pure-Go SQLite)
+- **MCP native.** stdio and HTTP transports, works with any MCP-compatible agent
+- **Cross-compiles anywhere Go does:** ARM32, ARM64, RISC-V, x86 in one command
+- **Scales up.** Add semantic vector search and hybrid re-ranking when your hardware allows
+- **Degrades gracefully.** Without models, vector/hybrid tools are hidden from the agent; BM25, get, and observations still work
+- **Safe under launchd/cron/systemd.** Progress output auto-quiets when stdout is not a TTY, so captured logs stay bounded
 
-## What's New in v0.4.0
+## What's New in v0.5.0
 
-Ports of the applicable QMD v2.1.0–v2.6.3 improvements, plus fixes to PicoQMD's own retrieval path (full details in [CHANGELOG.md](CHANGELOG.md)):
+Ports of the applicable QMD v2.8.x improvements plus hardening from a real-world failure (full details in [CHANGELOG.md](CHANGELOG.md)):
 
-- **Robust FTS5 queries** — version strings (`v3.9.7`), hyphenated terms (`real-time`), and operator words (AND/OR/NOT) can no longer produce FTS5 syntax errors; every term is emitted as a quoted phrase with prefix matching.
-- **Real document retrieval** — `get`/`multi_get` return content from disk with line-numbered output, `qmd://` + `#docid` headers, and line-range refs: `get notes.md:120:40` reads 40 lines from line 120. `--full-path` swaps in the on-disk path for piping into editors and file tools.
-- **BM25 snippets with line citations** — snippets are extracted from the source file (`>>>term<<<` highlighting, `path:L<n>`), which also feeds the reranker real text instead of bare titles.
-- **Embedding fingerprints** — vectors are stamped with the model + chunker identity; changing either marks documents pending for re-embed instead of silently searching stale vectors.
-- **Honest embed tracking** — a document only counts as embedded when *every* chunk has a current vector; interrupted embed runs resume instead of being forgotten.
-- **Concurrency-safe SQLite** — 120s busy timeout (override: `PICOQMD_SQLITE_BUSY_TIMEOUT`, ms) so a scheduled sync racing the MCP daemon queues instead of throwing `database is locked`.
-- **Scoped embedding** — `picoqmd embed -c <collection>` embeds one collection without re-indexing, so huge collections are opt-in.
-- **`--no-rerank`** — skip the cross-encoder for faster hybrid results on constrained hardware.
-- **First test suite** — `go test ./...` covers query sanitization, retrieval, and embed tracking against a real store.
+- **Model-hash embedding fingerprints.** The fingerprint now includes a sha256 of the model file's bytes, not just its name. A re-downloaded model with the same filename used to invalidate every stored vector silently; now it just triggers a re-embed.
+- **`picoqmd doctor`** reports model identity, per-fingerprint vector distribution, and stale or orphaned vectors, and exits non-zero on problems so cron jobs can gate on it.
+- **`picoqmd cleanup [--dry-run]`** deletes stale and orphaned vectors so the next `sync` regenerates them.
+- **`picoqmd bench <fixture.json>`** measures search quality (hit@k, precision, recall, MRR) per pipeline against a fixture of known-good queries. See `example-bench.json`.
+- **Multi-collection scope.** `collection` accepts a comma-separated list everywhere; each collection is searched separately and the results merged, so a big collection can't crowd a small one out of the top-k.
+- **Intent-aware expansion.** A dominant keyword match no longer skips LLM query expansion when the caller supplied an `intent` hint.
+- New `-c/--collection` flag on `search`, `vsearch`, and `query`.
+
+<details>
+<summary>v0.4.0 changes (QMD v2.1 to v2.6.3 ports)</summary>
+
+- **Robust FTS5 queries.** Version strings (`v3.9.7`), hyphenated terms (`real-time`), and operator words (AND/OR/NOT) can no longer produce FTS5 syntax errors; every term is emitted as a quoted phrase with prefix matching.
+- **Real document retrieval.** `get`/`multi_get` return content from disk with line-numbered output, `qmd://` + `#docid` headers, and line-range refs: `get notes.md:120:40` reads 40 lines from line 120. `--full-path` swaps in the on-disk path for piping into editors and file tools.
+- **BM25 snippets with line citations.** Snippets are extracted from the source file (`>>>term<<<` highlighting, `path:L<n>`), which also feeds the reranker real text instead of bare titles.
+- **Embedding fingerprints.** Vectors are stamped with the model + chunker identity; changing either marks documents pending for re-embed instead of silently searching stale vectors.
+- **Honest embed tracking.** A document only counts as embedded when *every* chunk has a current vector; interrupted embed runs resume instead of being forgotten.
+- **Concurrency-safe SQLite.** 120s busy timeout (override: `PICOQMD_SQLITE_BUSY_TIMEOUT`, ms) so a scheduled sync racing the MCP daemon queues instead of throwing `database is locked`.
+- **Scoped embedding.** `picoqmd embed -c <collection>` embeds one collection without re-indexing, so huge collections are opt-in.
+- **`--no-rerank`** skips the cross-encoder for faster hybrid results on constrained hardware.
+- **First test suite.** `go test ./...` covers query sanitization, retrieval, and embed tracking against a real store.
+
+</details>
 
 ## Quick Start
 
@@ -63,10 +78,10 @@ go install github.com/altSeneca/picoqmd@latest
 # Index markdown docs (default)
 picoqmd add ~/docs --no-embed
 
-# Index a codebase — Go, Python, TypeScript, and markdown
+# Index a codebase: Go, Python, TypeScript, and markdown
 picoqmd add ~/myproject --glob "**/*.{go,py,ts,md}" --no-embed
 
-# Search — prefix matching built in
+# Search, with prefix matching built in
 picoqmd search "kubernetes deployment"
 picoqmd search "deploy"          # matches "deployment", "deployed", "deploying"
 
@@ -76,7 +91,7 @@ picoqmd get notes.md:120:40      # 40 lines starting at line 120
 
 ## MCP Server
 
-PicoQMD is an MCP server first. Point your agent at it and get `search`, `get`, `multi_get`, `status` — plus `vector_search`, `deep_search`, and `research` when models are available.
+PicoQMD is an MCP server first. Point your agent at it and you get `search`, `get`, `multi_get`, and `status`, plus `vector_search`, `deep_search`, and `research` when models are available.
 
 ### Claude Code
 
@@ -119,6 +134,8 @@ Any agent that speaks [Model Context Protocol](https://modelcontextprotocol.io/)
 | `multi_get` | Batch retrieve by glob or comma-separated list; oversized files reported as skipped, never silently dropped | No |
 | `status` | Index health, embedding fingerprint, pending counts, stale observation count | No |
 
+Maintenance runs from the CLI: `doctor` diagnoses the index, `cleanup [--dry-run]` removes stale or orphaned vectors, and `bench <fixture.json>` scores search quality per pipeline.
+
 **Common parameters** across search tools:
 
 | Parameter | Type | Description |
@@ -126,8 +143,8 @@ Any agent that speaks [Model Context Protocol](https://modelcontextprotocol.io/)
 | `query` | string | Search query (required) |
 | `intent` | string | Optional disambiguation hint threaded through expansion, reranking, and snippets |
 | `limit` | int | Max results, default 10 |
-| `collection` | string | Filter to a specific collection |
-| `minScore` | float | Minimum relevance score 0–1 |
+| `collection` | string | Collection name, or a comma-separated list; each is searched separately and the results merged |
+| `minScore` | float | Minimum relevance score 0 to 1 |
 | `maxChars` | int | Truncate response to this many characters (server-side token budget) |
 | `note` | string | Save an observation linked to the top result |
 
@@ -135,7 +152,7 @@ Any agent that speaks [Model Context Protocol](https://modelcontextprotocol.io/)
 
 ## Two Modes
 
-### BM25 Only — For Edge and Constrained Devices
+### BM25 only, for edge and constrained devices
 
 ```sh
 picoqmd add ~/notes --no-embed
@@ -145,7 +162,7 @@ picoqmd search "meeting notes"
 
 No models, no llama.cpp, no downloads. Just Go + SQLite FTS5 with prefix matching. This is the mode for Pi-Zero-class devices where every megabyte counts: keyword search over ~10,000 documents runs in under 30MB of RAM.
 
-### Vector + Hybrid — For Capable Hardware
+### Vector + hybrid, for capable hardware
 
 ```sh
 picoqmd add ~/notes                    # downloads embedding model (~300MB)
@@ -154,7 +171,7 @@ picoqmd "semantic search query"        # auto-selects best pipeline
 picoqmd embed -c big-collection        # embed one collection at a time
 ```
 
-When you have the RAM, unlock semantic search with query expansion, RRF fusion, and cross-encoder re-ranking — all still local, all still offline. Same models QMD uses:
+When you have the RAM, add semantic search with query expansion, RRF fusion, and cross-encoder re-ranking. Still local, still offline. Same models QMD uses:
 
 | Model | Size | Purpose |
 |-------|------|---------|
@@ -171,12 +188,14 @@ When you have the RAM, unlock semantic search with query expansion, RRF fusion, 
 | Hybrid | `picoqmd query "query"` | Expansion + fan-out + RRF + re-ranking (`--no-expand`, `--no-rerank` to trim) |
 | Smart | `picoqmd "query"` | Auto-selects best pipeline for available models |
 
+All three accept `-c collection` or `-c colA,colB` to scope the search.
+
 ## Platform Support
 
 | Platform | BM25 | Vector/Hybrid | Binary |
 |----------|------|---------------|--------|
-| Linux arm32 (Pi Zero, Pi 1) | yes | — | ~9MB |
-| Linux riscv64 | yes | — | ~9MB |
+| Linux arm32 (Pi Zero, Pi 1) | yes | no | ~9MB |
+| Linux riscv64 | yes | no | ~9MB |
 | Linux arm64 (Pi 3/4/5, SBCs) | yes | yes | ~11MB |
 | Linux amd64 | yes | yes | ~11MB |
 | macOS arm64 (Apple Silicon) | yes | yes | ~11MB |
@@ -188,7 +207,7 @@ Cross-compile for your target in one line:
 GOOS=linux GOARCH=arm GOARM=7 go build -ldflags="-s -w" -o picoqmd .
 ```
 
-## Export / Import — Index Once, Search Anywhere
+## Export / Import: index once, search anywhere
 
 Build a full index (with embeddings) on a capable machine, then transfer it to a tiny device:
 
@@ -217,7 +236,7 @@ picoqmd search "query" --remote server:8181
 
 ## File Type Support
 
-Index any text file — not just markdown. Use glob patterns with brace expansion:
+Index any text file, not just markdown. Use glob patterns with brace expansion:
 
 ```sh
 picoqmd add . --glob "**/*.md"                        # markdown only (default)
@@ -229,17 +248,17 @@ PicoQMD automatically skips binary files, files over 1MB, and common noise direc
 
 ## Use Cases
 
-- **QMD alternative on low-spec hardware** — same local hybrid search without the Node.js runtime, on machines from a Pi Zero up
-- **Claude Code MCP server** — fast, token-efficient search over large codebases without spinning up Elasticsearch
-- **PicoClaw / MiniClaw search tool** — give your $10 AI agent fast local search over project docs, wikis, and codebases
-- **OpenClaw on Raspberry Pi** — add document search to your self-hosted AI assistant without eating its RAM budget
-- **Edge AI knowledge base** — deploy searchable documentation to field devices, kiosks, or air-gapped environments
-- **Offline dev search** — index API docs, READMEs, and notes for airplane-mode development
-- **Token-efficient MCP pipelines** — use `research` to cut context window usage by ~50% vs separate search calls
+- **QMD alternative on low-spec hardware:** the same local hybrid search without the Node.js runtime, on machines from a Pi Zero up
+- **Claude Code MCP server:** fast, token-efficient search over large codebases without spinning up Elasticsearch
+- **PicoClaw / MiniClaw search tool:** give your $10 AI agent fast local search over project docs, wikis, and codebases
+- **OpenClaw on Raspberry Pi:** add document search to your self-hosted AI assistant without eating its RAM budget
+- **Edge AI knowledge base:** deploy searchable documentation to field devices, kiosks, or air-gapped environments
+- **Offline dev search:** index API docs, READMEs, and notes for airplane-mode development
+- **Token-efficient MCP pipelines:** use `research` to cut context window usage by ~50% vs separate search calls
 
 ## Roadmap
 
-See [ROADMAP.md](ROADMAP.md) — next up: Matryoshka 768→256 embedding truncation (3× smaller/faster vectors), chunk-level incremental re-embedding, recency-aware ranking, binary quantization with two-phase rescoring for very large corpora, and tree-sitter AST chunking for code.
+See [ROADMAP.md](ROADMAP.md). Next up: Matryoshka 768→256 embedding truncation (3× smaller and faster vectors), chunk-level incremental re-embedding, recency-aware ranking, binary quantization with two-phase rescoring for very large corpora, and tree-sitter AST chunking for code.
 
 ## Acknowledgments
 

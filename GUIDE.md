@@ -2,7 +2,7 @@
 
 A fully local search engine for markdown documents. Single binary, zero cloud dependencies, runs anywhere.
 
-PicoQMD is an optimized Go port of [QMD](https://www.npmjs.com/package/@tobilu/qmd) — supporting BM25 full-text search, semantic vector search, and a hybrid pipeline with query expansion, RRF fusion, and LLM re-ranking.
+PicoQMD is an optimized Go port of [QMD](https://www.npmjs.com/package/@tobilu/qmd). It supports BM25 full-text search, semantic vector search, and a hybrid pipeline with query expansion, RRF fusion, and LLM re-ranking.
 
 ## Quick Start
 
@@ -28,13 +28,13 @@ sudo mv picoqmd /usr/local/bin/
 
 ## Core Concepts
 
-**Collections** — A directory of files registered for indexing. Each collection has a name, path, glob pattern, and optional context description.
+**Collections.** A directory of files registered for indexing. Each collection has a name, path, glob pattern, and optional context description.
 
-**Documents** — Individual files within a collection. Each gets a short content-hash ID (e.g., `#a3f2c1`) for quick reference.
+**Documents.** Individual files within a collection. Each gets a short content-hash ID (e.g., `#a3f2c1`) for quick reference.
 
-**Chunks** — Documents are split into ~900-token pieces at structural boundaries (headings, paragraphs) for embedding.
+**Chunks.** Documents are split into ~900-token pieces at structural boundaries (headings, paragraphs) for embedding.
 
-**Embeddings** — Vector representations of chunks, enabling semantic search. Generated locally using a 300MB GGUF model.
+**Embeddings.** Vector representations of chunks, enabling semantic search. Generated locally using a 300MB GGUF model.
 
 ## Search Modes
 
@@ -83,7 +83,7 @@ picoqmd "API endpoint design" --limit 5 --format md
 
 ## Commands
 
-### `add` — Add and Index a Directory
+### `add`: add and index a directory
 
 ```
 picoqmd add <path> [flags]
@@ -91,8 +91,8 @@ picoqmd add <path> [flags]
 
 This is the main onboarding command. On first run (when no models are present), it prompts you to choose a setup mode:
 
-- **[1] BM25 only** — keyword search, no downloads, runs on any device
-- **[2] BM25 + vector** — semantic search, downloads embedding model (~300MB)
+- **[1] BM25 only:** keyword search, no downloads, runs on any device
+- **[2] BM25 + vector:** semantic search, downloads embedding model (~300MB)
 
 Use `--no-embed` to skip the prompt and force BM25-only mode. In non-interactive environments (piped input), it defaults to vector mode.
 
@@ -103,10 +103,10 @@ Steps:
 4. Generates embeddings for all documents (unless BM25-only)
 
 Flags:
-- `--name` — Collection name (defaults to directory basename)
-- `--glob` — File pattern (default: `**/*.md`)
-- `--context` — Human description for LLM context (improves search relevance)
-- `--no-embed` — Skip embedding; BM25-only fast indexing
+- `--name`: collection name (defaults to directory basename)
+- `--glob`: file pattern (default: `**/*.md`)
+- `--context`: human description for LLM context (improves search relevance)
+- `--no-embed`: skip embedding; BM25-only fast indexing
 
 Examples:
 ```
@@ -116,36 +116,38 @@ picoqmd add ~/code --glob "**/*.{md,txt}" --name code-docs
 picoqmd add ~/wiki --no-embed                    # BM25 only, instant
 ```
 
-### `sync` — Re-index and Re-embed
+### `sync`: re-index and re-embed
 
 ```
 picoqmd sync
 picoqmd sync --no-embed    # re-index only, skip embedding
 ```
 
-Detects changed files across all collections, re-indexes them, and generates embeddings for new/modified documents. Incremental — only processes what changed. Use `--no-embed` to re-index without triggering model downloads or embedding.
+Detects changed files across all collections, re-indexes them, and generates embeddings for new/modified documents. Incremental: only what changed gets processed. Use `--no-embed` to re-index without triggering model downloads or embedding.
 
 `update` and `embed` are aliases for `sync`.
 
-### `search` — BM25 Full-text Search
+### `search`: BM25 full-text search
 
 ```
-picoqmd search <query> [--limit N] [--format FORMAT]
+picoqmd search <query> [-c collection] [--limit N] [--format FORMAT]
 ```
 
-### `vsearch` — Semantic Vector Search
+### `vsearch`: semantic vector search
 
 ```
-picoqmd vsearch <query> [--limit N] [--format FORMAT]
+picoqmd vsearch <query> [-c collection] [--limit N] [--format FORMAT]
 ```
 
-### `query` — Full Hybrid Search
+### `query`: full hybrid search
 
 ```
-picoqmd query <query> [--limit N] [--format FORMAT]
+picoqmd query <query> [-c collection] [--limit N] [--format FORMAT]
 ```
 
-### `get` — Retrieve a Document
+All three accept `-c/--collection` with a single name or a comma-separated list (`-c "docs,notes"`). With a list, each collection is searched separately and the results merged, so one big collection can't crowd out a small one.
+
+### `get`: retrieve a document
 
 ```
 picoqmd get <ref>
@@ -153,7 +155,7 @@ picoqmd get <ref>
 
 Retrieve by docid (`#a3f2c1`) or file path.
 
-### `status` — Index Statistics
+### `status`: index statistics
 
 ```
 picoqmd status
@@ -161,7 +163,30 @@ picoqmd status
 
 Shows collection count, document count, chunk count, and database path.
 
-### `model` — Manage Models
+### `doctor`: diagnose index health
+
+```
+picoqmd doctor
+```
+
+Reports model identity (size and content hash), the current embedding fingerprint, per-fingerprint vector counts, and any stale or orphaned vectors. Exits non-zero when problems are found, so cron and launchd jobs can gate on it.
+
+### `cleanup`: remove stale and orphaned vectors
+
+```
+picoqmd cleanup --dry-run    # report what would be deleted
+picoqmd cleanup              # delete; then run `picoqmd sync` to re-embed
+```
+
+### `bench`: measure search quality
+
+```
+picoqmd bench fixture.json [--pipeline bm25|vector|research|hybrid] [--misses]
+```
+
+Scores each pipeline against a fixture of queries with known-good results (hit@k, precision, recall, MRR). See `example-bench.json` for the format. Useful before and after any change to models, chunking, or ranking.
+
+### `model`: manage models
 
 ```
 picoqmd model list                    # show available models and status
@@ -178,7 +203,7 @@ Models (~2GB total):
 | reranker | ~600MB | Cross-encoder re-ranking (opt-in via `model download`) |
 | expansion | ~1GB | Query expansion (opt-in via `model download`) |
 
-### `mcp` — MCP Server
+### `mcp`: MCP server
 
 ```
 picoqmd mcp                           # stdio transport (for Claude Code/Desktop)
@@ -201,7 +226,7 @@ Add to `~/.claude/mcp.json`:
 }
 ```
 
-### `context` — Context Descriptions
+### `context`: context descriptions
 
 ```
 picoqmd context add "qmd://docs" "Project architecture and API documentation"
@@ -209,7 +234,7 @@ picoqmd context add "qmd://docs" "Project architecture and API documentation"
 
 Attaches a human-readable description to a collection path, improving search relevance.
 
-### `collection` — Collection Management
+### `collection`: collection management
 
 ```
 picoqmd collection add <path> [flags]   # alias for top-level 'add'
@@ -273,19 +298,19 @@ Override with `XDG_CONFIG_HOME` and `XDG_CACHE_HOME`.
 Input query
     |
     v
-[Query Expansion] — LLM generates 2 alternative queries (lex + vec)
+[Query Expansion]      LLM generates 2 alternative queries (lex + vec)
     |
     v
-[Fan-Out] — Each query searched via BM25 AND vector (parallel)
+[Fan-Out]              Each query searched via BM25 AND vector (parallel)
     |
     v
-[RRF Fusion] — Reciprocal Rank Fusion merges all result lists
-    |              with top-rank bonuses and original-query weighting
+[RRF Fusion]           Reciprocal Rank Fusion merges all result lists,
+    |                  with top-rank bonuses and original-query weighting
     v
-[LLM Re-ranking] — Cross-encoder scores top 30 candidates
+[LLM Re-ranking]       Cross-encoder scores top 30 candidates
     |
     v
-[Position-aware Blend] — Weighted merge of RRF + reranker scores
+[Position-aware Blend] Weighted merge of RRF + reranker scores
     |
     v
 Final ranked results
@@ -344,7 +369,7 @@ Then export or use `--remote` to give the sensor device search access.
 
 - **Use keyword search 80% of the time.** It's instant and handles exact lookups perfectly.
 - **Reserve `query` / deep search** for complex conceptual questions.
-- **Add context descriptions** to collections — they improve search quality.
+- **Add context descriptions** to collections; they improve search quality.
 - **Run `picoqmd sync` periodically** or via cron to keep the index fresh. PicoQMD does not auto-watch for file changes.
 - **The `--no-embed` flag** is useful for fast initial indexing when you only need keyword search.
 - **Use `--remote` on small devices** to leverage a bigger machine's full search pipeline.
@@ -377,6 +402,9 @@ picoqmd sync                               # re-index + re-embed changed files
 picoqmd sync --no-embed                    # re-index only, no embedding
 picoqmd update                             # alias for sync
 picoqmd status                             # collection/document/chunk counts
+picoqmd doctor                             # model identity + stale/orphan vector check
+picoqmd cleanup --dry-run                  # preview stale/orphan vector removal
+picoqmd bench fixture.json                 # score search quality per pipeline
 
 # ── RETRIEVAL ──────────────────────────────────────────
 picoqmd get "#a3f2c1"                      # fetch by docid
@@ -406,8 +434,8 @@ watch -n 60 picoqmd sync                                     # auto-sync every m
 echo '0 2 * * * picoqmd sync' | crontab -                   # nightly sync at 2am
 
 # ── MODELS ─────────────────────────────────────────────
-# embedding  (~300MB) — auto-downloaded by 'add', enables vector search
-# reranker   (~600MB) — opt-in, enables cross-encoder re-ranking
-# expansion  (~1GB)   — opt-in, enables query expansion
+# embedding  (~300MB)  auto-downloaded by 'add', enables vector search
+# reranker   (~600MB)  opt-in, enables cross-encoder re-ranking
+# expansion  (~1GB)    opt-in, enables query expansion
 # All 3 needed for full hybrid pipeline ('query' / smart search)
 ```

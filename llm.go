@@ -555,18 +555,15 @@ func hasStrongSignal(results []SearchResult) bool {
 func (h *HybridSearcher) Search(ctx context.Context, query, intent, collection string, limit int) ([]SearchResult, error) {
 	// Probe BM25 first. Cheap (~ms) and lets us decide whether to spend
 	// 150–400ms running the LLM ExpandQuery model.
-	var probeBM25 []SearchResult
-	var probeErr error
-	if collection != "" {
-		probeBM25, probeErr = h.store.SearchBM25InCollection(query, collection, strongSignalProbeN)
-	} else {
-		probeBM25, probeErr = h.store.SearchBM25Normalized(query, strongSignalProbeN)
-	}
+	probeBM25, probeErr := h.store.SearchBM25Scoped(query, collection, strongSignalProbeN)
 	if probeErr != nil {
 		probeBM25 = nil
 	}
 
-	skipExpand := h.noExpand || hasStrongSignal(probeBM25)
+	// A strong BM25 signal skips expansion — unless the caller supplied an
+	// intent: the obvious keyword match may not match the intent, so the
+	// expansion stage (which sees the intent) must still run. (qmd 2.1)
+	skipExpand := h.noExpand || (intent == "" && hasStrongSignal(probeBM25))
 
 	var expansions []QueryExpansion
 	if !skipExpand {
@@ -613,13 +610,7 @@ func (h *HybridSearcher) Search(ctx context.Context, query, intent, collection s
 				wg.Add(1)
 				go func() {
 					defer wg.Done()
-					var results []SearchResult
-					var err error
-					if collection != "" {
-						results, err = h.store.SearchBM25InCollection(wq.query, collection, strongSignalProbeN)
-					} else {
-						results, err = h.store.SearchBM25Normalized(wq.query, strongSignalProbeN)
-					}
+					results, err := h.store.SearchBM25Scoped(wq.query, collection, strongSignalProbeN)
 					if err != nil {
 						return
 					}
@@ -641,12 +632,7 @@ func (h *HybridSearcher) Search(ctx context.Context, query, intent, collection s
 				// the expansion variant — the expansion drives the embedding,
 				// but highlights should reflect the user's actual words.
 				snippetText := combineForSnippet(query, intent)
-				var results []SearchResult
-				if collection != "" {
-					results, err = h.store.SearchVectorInCollection(snippetText, qvec, collection, 20)
-				} else {
-					results, err = h.store.SearchVector(snippetText, qvec, 20)
-				}
+				results, err := h.store.SearchVectorScoped(snippetText, qvec, collection, 20)
 				if err != nil {
 					return
 				}
