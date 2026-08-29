@@ -1,6 +1,6 @@
 # PicoQMD: a lightweight QMD alternative for low-resource computers
 
-**A fully local search engine and MCP server in a single ~15MB Go binary.** PicoQMD is a from-scratch Go reimplementation of [tobi's QMD](https://github.com/tobi/qmd) built for machines where QMD's Node.js/Bun stack is too heavy: Raspberry Pi (including Pi Zero), old laptops, small VPSes, air-gapped boxes, and dev machines that just don't want another Node runtime.
+**A fully local search engine and MCP server in a single ~16MB Go binary (~11MB stripped).** PicoQMD is a from-scratch Go reimplementation of [tobi's QMD](https://github.com/tobi/qmd) built for machines where QMD's Node.js/Bun stack is too heavy: Raspberry Pi (including Pi Zero), old laptops, small VPSes, air-gapped boxes, and dev machines that just don't want another Node runtime.
 
 It runs the same search pipeline as QMD (SQLite FTS5 BM25, semantic vector search, hybrid query expansion + Reciprocal Rank Fusion + cross-encoder reranking, the same GGUF models) without Node.js, Bun, Python, or native-module ABI headaches. One static binary and a SQLite file.
 
@@ -12,7 +12,7 @@ If you're looking for "QMD but for a lower-spec computer", this is the trade-off
 
 |  | QMD | PicoQMD |
 |--|-----|---------|
-| Install | Node.js/Bun + npm package (native modules: better-sqlite3, sqlite-vec, node-llama-cpp) | one static Go binary (~15MB) |
+| Install | Node.js/Bun + npm package (native modules: better-sqlite3, sqlite-vec, node-llama-cpp) | one static Go binary (~16MB, ~11MB stripped) |
 | Runtime | Node/Bun VM | none (measured **~29MB peak RSS** for a BM25 search over a 10,800-doc index) |
 | BM25 keyword search | SQLite FTS5 | SQLite FTS5 (pure-Go driver, contentless index; documents are not duplicated into the DB) |
 | Semantic vector search | sqlite-vec + node-llama-cpp | pure-Go brute-force cosine + llama.cpp via FFI (same EmbeddingGemma model) |
@@ -33,7 +33,7 @@ PicoQMD is not a fork. It's an independent Go implementation that tracks QMD's r
 
 Most search tools assume fast hardware. PicoQMD is built for everything else:
 
-- **~15MB binary** (~11MB with `-ldflags="-s -w"`), smaller than most npm installs
+- **~16MB binary** (~11MB with `-ldflags="-s -w"`), smaller than most npm installs
 - **Minimal RAM.** BM25 mode runs in tens of MB and fits alongside an agent on $10 hardware
 - **Zero dependencies.** No runtime, no interpreters, no containers, no C toolchain (pure-Go SQLite)
 - **MCP native.** stdio and HTTP transports, works with any MCP-compatible agent
@@ -194,12 +194,12 @@ All three accept `-c collection` or `-c colA,colB` to scope the search.
 
 | Platform | BM25 | Vector/Hybrid | Binary |
 |----------|------|---------------|--------|
-| Linux arm32 (Pi Zero, Pi 1) | yes | no | ~9MB |
-| Linux riscv64 | yes | no | ~9MB |
+| Linux arm32 (Pi Zero, Pi 1) | yes | no | ~11MB |
+| Linux riscv64 | yes | no | ~10MB |
 | Linux arm64 (Pi 3/4/5, SBCs) | yes | yes | ~11MB |
 | Linux amd64 | yes | yes | ~11MB |
 | macOS arm64 (Apple Silicon) | yes | yes | ~11MB |
-| macOS amd64 (Intel) | yes | yes | ~11MB |
+| macOS amd64 (Intel) | yes | yes | ~12MB |
 
 Cross-compile for your target in one line:
 
