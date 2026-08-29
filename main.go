@@ -55,7 +55,7 @@ import (
 // ---------------------------------------------------------------------------
 
 const (
-	version       = "0.6.1"
+	version       = "0.6.2"
 	defaultDB     = "index.sqlite"
 	chunkTarget   = 900 // target tokens per chunk
 	chunkLookback = 200 // tokens to look back for break points
@@ -2442,6 +2442,21 @@ func embedTargetDim() int {
 		}
 	}
 	return 256
+}
+
+// rerankSkipRatio controls rerank-on-ambiguity: when the top RRF-fused
+// result is at least this multiple of the rank-3 score, the ordering is
+// treated as settled and the cross-encoder stage (the bulk of hybrid
+// latency) is skipped. Same scale-free shape as the strong-signal expansion
+// bypass. PICOQMD_RERANK_SKIP_RATIO overrides; 0 disables the skip
+// (always rerank).
+func rerankSkipRatio() float64 {
+	if v := os.Getenv("PICOQMD_RERANK_SKIP_RATIO"); v != "" {
+		if f, err := strconv.ParseFloat(v, 64); err == nil && f >= 0 {
+			return f
+		}
+	}
+	return 2.0
 }
 
 // truncateMRL truncates a Matryoshka-trained embedding to dim and

@@ -1,5 +1,23 @@
 # Changelog
 
+## [0.6.2] - 2026-08-29
+
+### Rerank-on-ambiguity
+
+- The cross-encoder pass now runs only when the RRF-fused ranking is
+  actually contested: when the top result is at least 2x the rank-3 score
+  (the same scale-free test the strong-signal expansion bypass uses), the
+  ordering is treated as settled and the rerank stage is skipped. Close
+  calls still get the full 30-candidate / 1500-char rerank — nothing about
+  rerank quality is trimmed.
+- `PICOQMD_RERANK_SKIP_RATIO` tunes the gate (default 2.0; 0 = always
+  rerank). Skips are logged with the scores that triggered them.
+- Measured on the reference fixture: quality identical to always-rerank
+  (hit@10 100%, MRR 1.00, precision 0.32), 2 of 5 queries skipped. Hybrid
+  latency per query: ~8s when both LLM stages run, ~3.5s when rerank skips
+  (expansion dominates), ~0.4s when the BM25 strong signal also skips
+  expansion.
+
 ## [0.6.1] - 2026-08-29
 
 ### Reranker fixed: hybrid is now the best pipeline

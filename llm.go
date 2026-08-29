@@ -703,23 +703,42 @@ func (h *HybridSearcher) Search(ctx context.Context, query, intent, collection s
 		rrfRanked = rrfRanked[:maxRerank]
 	}
 
+	// Rerank-on-ambiguity: when the fused top result is confidently ahead
+	// (same scale-free test as the strong-signal expansion bypass), the
+	// ordering is already settled and the cross-encoder pass — the bulk of
+	// hybrid latency — can't change the outcome enough to pay for itself.
+	// Close calls still get the full 30-candidate rerank.
+	skipRerank := h.noRerank
+	if !skipRerank {
+		if ratio := rerankSkipRatio(); ratio > 0 && len(rrfRanked) >= strongSignalRankN {
+			top := rrfRanked[0].score
+			cmp := rrfRanked[strongSignalRankN-1].score
+			if cmp > 0 && top >= ratio*cmp {
+				skipRerank = true
+				log.Printf("  rerank skipped: RRF top confident (%.3f >= %.1f x %.3f)", top, ratio, cmp)
+			}
+		}
+	}
+
 	// LLM re-ranking. Judge the document region the match came from, not
 	// just title+snippet — vector-found docs often have thin or empty
 	// snippets, which starved the reranker of anything to score.
 	var candidateTexts []string
-	for _, entry := range rrfRanked {
-		doc := docByID[entry.docID]
-		text := h.store.RerankText(doc.DocID, doc.Line, 1500)
-		if text == "" {
-			text = doc.Snippet
+	if !skipRerank {
+		for _, entry := range rrfRanked {
+			doc := docByID[entry.docID]
+			text := h.store.RerankText(doc.DocID, doc.Line, 1500)
+			if text == "" {
+				text = doc.Snippet
+			}
+			candidateTexts = append(candidateTexts, doc.Title+"\n"+text)
 		}
-		candidateTexts = append(candidateTexts, doc.Title+"\n"+text)
 	}
 
 	var rerankScores []float64
 	var err error
-	if h.noRerank {
-		err = fmt.Errorf("rerank disabled")
+	if skipRerank {
+		err = fmt.Errorf("rerank skipped")
 	} else {
 		rerankScores, err = h.engine.Rerank(query, intent, candidateTexts)
 	}
