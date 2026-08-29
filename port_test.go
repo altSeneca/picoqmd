@@ -77,6 +77,42 @@ func TestModelFileHashSidecar(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
+// truncateMRL — Matryoshka truncation
+// ---------------------------------------------------------------------------
+
+func TestTruncateMRL(t *testing.T) {
+	vec := []float32{3, 4, 0, 0, 5, 12}
+	out := truncateMRL(vec, 2)
+	if len(out) != 2 {
+		t.Fatalf("len = %d, want 2", len(out))
+	}
+	// [3,4] has norm 5 → renormalized to [0.6, 0.8]
+	if out[0] != 0.6 || out[1] != 0.8 {
+		t.Fatalf("got %v, want [0.6 0.8]", out)
+	}
+	var norm float64
+	for _, x := range out {
+		norm += float64(x) * float64(x)
+	}
+	if norm < 0.999 || norm > 1.001 {
+		t.Fatalf("norm = %v, want 1", norm)
+	}
+
+	// No-op cases: dim 0 and already-small vectors return the input.
+	if got := truncateMRL(vec, 0); len(got) != len(vec) {
+		t.Fatal("dim 0 should be a no-op")
+	}
+	if got := truncateMRL(vec, 10); len(got) != len(vec) {
+		t.Fatal("dim > len should be a no-op")
+	}
+	// Zero vector: no NaNs.
+	z := truncateMRL([]float32{0, 0, 0, 0}, 2)
+	if z[0] != 0 || z[1] != 0 {
+		t.Fatalf("zero vector mangled: %v", z)
+	}
+}
+
+// ---------------------------------------------------------------------------
 // bench — matching and metrics
 // ---------------------------------------------------------------------------
 

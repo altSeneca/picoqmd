@@ -55,7 +55,7 @@ import (
 // ---------------------------------------------------------------------------
 
 const (
-	version       = "0.5.0"
+	version       = "0.6.0"
 	defaultDB     = "index.sqlite"
 	chunkTarget   = 900 // target tokens per chunk
 	chunkLookback = 200 // tokens to look back for break points
@@ -2378,8 +2378,47 @@ func embedFingerprint() string {
 			// written under this fallback.
 			embedFPCached = name + "|" + chunkerVersion
 		}
+		if dim := embedTargetDim(); dim > 0 {
+			embedFPCached += fmt.Sprintf("|d%d", dim)
+		}
 	})
 	return embedFPCached
+}
+
+// embedTargetDim returns the Matryoshka truncation dimension for embeddings.
+// EmbeddingGemma is MRL-trained, so keeping the first N dims and
+// L2-renormalizing is the sanctioned way to get an N-dim embedding: 256 dims
+// keep ~97.6% of MTEB quality at 3x smaller storage and 3x faster brute-force
+// scans. Override with PICOQMD_EMBED_DIM (0 = full model dimension).
+func embedTargetDim() int {
+	if v := os.Getenv("PICOQMD_EMBED_DIM"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 0 {
+			return n
+		}
+	}
+	return 256
+}
+
+// truncateMRL truncates a Matryoshka-trained embedding to dim and
+// L2-renormalizes. No-op when dim is 0 or the vector is already <= dim.
+func truncateMRL(vec []float32, dim int) []float32 {
+	if dim <= 0 || len(vec) <= dim {
+		return vec
+	}
+	out := make([]float32, dim)
+	var norm float64
+	for i := 0; i < dim; i++ {
+		norm += float64(vec[i]) * float64(vec[i])
+	}
+	if norm == 0 {
+		copy(out, vec[:dim])
+		return out
+	}
+	inv := float32(1.0 / math.Sqrt(norm))
+	for i := 0; i < dim; i++ {
+		out[i] = vec[i] * inv
+	}
+	return out
 }
 
 // modelFileHash returns the first 16 hex chars of the model file's sha256.
@@ -3486,6 +3525,7 @@ Quick start:
 	root.AddCommand(topAddCmd, syncCmd, collectionCmd, updateCmd, embedCmd, searchCmd, vsearchCmd, queryCmd, getCmd, statusCmd, mcpCmd, contextCmd, modelCmd, embedWorkerCmd, exportCmd, importCmd,
 		newDoctorCmd(func() string { return dbPath(indexName) }),
 		newCleanupCmd(func() string { return dbPath(indexName) }),
+		newMigrateVectorsCmd(func() string { return dbPath(indexName) }),
 		newBenchCmd(func() string { return dbPath(indexName) }))
 
 	if err := root.Execute(); err != nil {

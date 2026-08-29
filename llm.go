@@ -351,7 +351,9 @@ func (e *LLMEngine) Embed(text string, isQuery bool) ([]float32, error) {
 
 	result := make([]float32, len(vec))
 	copy(result, vec)
-	return result, nil
+	// Matryoshka truncation: both document and query embeddings pass through
+	// here (BatchEmbed delegates), so stored and query vectors always agree.
+	return truncateMRL(result, embedTargetDim()), nil
 }
 
 func (e *LLMEngine) BatchEmbed(texts []string) ([][]float32, error) {

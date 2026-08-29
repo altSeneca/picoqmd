@@ -1,5 +1,28 @@
 # Changelog
 
+## [0.6.0] - 2026-08-29
+
+### Matryoshka-256 vectors (ROADMAP phase 1, item 1)
+
+- **Embeddings are truncated to 256 dims by default** (EmbeddingGemma's
+  native 768 → first 256 + L2-renormalize) at a single point in `Embed()`,
+  so document and query vectors always agree. EmbeddingGemma is MRL-trained;
+  published cost is ~2.4% MTEB for 3× smaller storage and 3× faster
+  brute-force scans.
+- **`picoqmd migrate-vectors`**: in-place conversion of an existing index.
+  The MRL property means truncate+renormalize is exactly what embedding at
+  the lower dimension produces, so a 32K-vector index migrates in seconds
+  instead of a 40-minute re-embed. VACUUMs and reports the size change.
+- `PICOQMD_EMBED_DIM` env var overrides the target dimension (0 = full
+  model dimension, for A/B benching). The dimension is folded into the
+  embedding fingerprint (`...|cv1|d256`), so mixed-dimension search is
+  structurally impossible and `doctor` flags any mismatch.
+- Measured on the 10,800-doc reference corpus: index 853MB → 743MB
+  (vectors 66MB smaller, rest was VACUUM reclaiming prior churn), vector
+  search 0.5s → 0.3s end-to-end, bench quality within noise of 768-dim
+  (hit@10 100% unchanged, MRR 1.0 → 0.9, precision@10 0.30 → 0.32 on the
+  5-query fixture).
+
 ## [0.5.0] - 2026-08-29
 
 Five features ported from upstream qmd's 2.5.3→2.8.3 run, adapted to

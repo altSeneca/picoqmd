@@ -14,6 +14,7 @@ If you're looking for "QMD but for a lower-spec computer", this is the trade-off
 |--|-----|---------|
 | Install | Node.js/Bun + npm package (native modules: better-sqlite3, sqlite-vec, node-llama-cpp) | one static Go binary (~16MB, ~11MB stripped) |
 | Runtime | Node/Bun VM | none (measured **~29MB peak RSS** for a BM25 search over a 10,800-doc index) |
+| Index size on disk | ~11.9GB measured on a 10,800-doc corpus | **0.78GB for the same corpus (~15× smaller)** with 256-dim Matryoshka vectors (default since v0.6.0) |
 | BM25 keyword search | SQLite FTS5 | SQLite FTS5 (pure-Go driver, contentless index; documents are not duplicated into the DB) |
 | Semantic vector search | sqlite-vec + node-llama-cpp | pure-Go brute-force cosine + llama.cpp via FFI (same EmbeddingGemma model) |
 | Hybrid pipeline | query expansion → fan-out → RRF → rerank | same design, same GGUF models |
@@ -34,6 +35,8 @@ PicoQMD is not a fork. It's an independent Go implementation that tracks QMD's r
 Most search tools assume fast hardware. PicoQMD is built for everything else:
 
 - **~16MB binary** (~11MB with `-ldflags="-s -w"`), smaller than most npm installs
+- **~15× smaller index than QMD.** The 10,800-doc corpus that filled an 11.9GB QMD index fits in 0.78GB, measured on the same machine and models
+- **3× smaller, 3× faster vectors.** Embeddings are Matryoshka-truncated to 256 dims by default (EmbeddingGemma is MRL-trained; ~97.6% of full quality). `PICOQMD_EMBED_DIM` overrides
 - **Minimal RAM.** BM25 mode runs in tens of MB and fits alongside an agent on $10 hardware
 - **Zero dependencies.** No runtime, no interpreters, no containers, no C toolchain (pure-Go SQLite)
 - **MCP native.** stdio and HTTP transports, works with any MCP-compatible agent
@@ -42,9 +45,18 @@ Most search tools assume fast hardware. PicoQMD is built for everything else:
 - **Degrades gracefully.** Without models, vector/hybrid tools are hidden from the agent; BM25, get, and observations still work
 - **Safe under launchd/cron/systemd.** Progress output auto-quiets when stdout is not a TTY, so captured logs stay bounded
 
-## What's New in v0.5.0
+## What's New in v0.6.0
 
-Ports of the applicable QMD v2.8.x improvements plus hardening from a real-world failure (full details in [CHANGELOG.md](CHANGELOG.md)):
+Matryoshka-256 vectors (full details in [CHANGELOG.md](CHANGELOG.md)):
+
+- **Embeddings are truncated to 256 dims** (from EmbeddingGemma's 768) and L2-renormalized, at both document and query time. 3× smaller vector storage, 3× faster brute-force scans, ~97.6% of full-dimension quality. Measured on a 10,800-doc corpus: index 853MB → 743MB, vector search 0.5s → 0.3s, bench quality within noise of 768-dim (hit@10 unchanged at 100%, MRR 1.0 → 0.9 on a 5-query fixture).
+- **`picoqmd migrate-vectors`** converts an existing index in place in seconds. MRL training means truncate+renormalize produces exactly what embedding at 256 dims would; no re-embed needed. Includes a VACUUM to reclaim the space.
+- `PICOQMD_EMBED_DIM` overrides the target (0 = full model dimension). The dimension is part of the embedding fingerprint, so mixed-dimension search is impossible; `doctor` flags mismatches.
+
+<details>
+<summary>v0.5.0 changes (QMD v2.8.x ports)</summary>
+
+Ports of the applicable QMD v2.8.x improvements plus hardening from a real-world failure:
 
 - **Model-hash embedding fingerprints.** The fingerprint now includes a sha256 of the model file's bytes, not just its name. A re-downloaded model with the same filename used to invalidate every stored vector silently; now it just triggers a re-embed.
 - **`picoqmd doctor`** reports model identity, per-fingerprint vector distribution, and stale or orphaned vectors, and exits non-zero on problems so cron jobs can gate on it.
@@ -53,6 +65,8 @@ Ports of the applicable QMD v2.8.x improvements plus hardening from a real-world
 - **Multi-collection scope.** `collection` accepts a comma-separated list everywhere; each collection is searched separately and the results merged, so a big collection can't crowd a small one out of the top-k.
 - **Intent-aware expansion.** A dominant keyword match no longer skips LLM query expansion when the caller supplied an `intent` hint.
 - New `-c/--collection` flag on `search`, `vsearch`, and `query`.
+
+</details>
 
 <details>
 <summary>v0.4.0 changes (QMD v2.1 to v2.6.3 ports)</summary>
@@ -258,7 +272,7 @@ PicoQMD automatically skips binary files, files over 1MB, and common noise direc
 
 ## Roadmap
 
-See [ROADMAP.md](ROADMAP.md). Next up: Matryoshka 768→256 embedding truncation (3× smaller and faster vectors), chunk-level incremental re-embedding, recency-aware ranking, binary quantization with two-phase rescoring for very large corpora, and tree-sitter AST chunking for code.
+See [ROADMAP.md](ROADMAP.md). Matryoshka 768→256 truncation shipped in v0.6.0. Next up: chunk-level incremental re-embedding, recency-aware ranking, binary quantization with two-phase rescoring for very large corpora, and tree-sitter AST chunking for code.
 
 ## Acknowledgments
 

@@ -14,6 +14,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 
@@ -192,6 +193,108 @@ func newDoctorCmd(dbPathFn func() string) *cobra.Command {
 			fmt.Printf("\n%d problem(s) found. `picoqmd cleanup` removes stale/orphaned vectors,\nthen `picoqmd sync` re-embeds what's missing.\n", problems)
 			// Non-zero exit so scripts (launchd refresh, CI) can gate on health.
 			os.Exit(1)
+			return nil
+		},
+	}
+}
+
+// newMigrateVectorsCmd truncates stored higher-dimension vectors to the
+// current Matryoshka target in place. For MRL-trained models (EmbeddingGemma)
+// truncate+renormalize is exactly what embedding at the lower dimension
+// produces, so this is a seconds-long migration instead of a full re-embed.
+func newMigrateVectorsCmd(dbPathFn func() string) *cobra.Command {
+	return &cobra.Command{
+		Use:   "migrate-vectors",
+		Short: "Truncate stored MRL vectors to the current target dimension (instant alternative to re-embedding)",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			dim := embedTargetDim()
+			if dim <= 0 {
+				return fmt.Errorf("PICOQMD_EMBED_DIM is 0 (full dimension); nothing to truncate to")
+			}
+			fp := embedFingerprint()
+			dbp := dbPathFn()
+			sizeBefore := int64(0)
+			if st, err := os.Stat(dbp); err == nil {
+				sizeBefore = st.Size()
+			}
+
+			store, err := NewStore(dbp)
+			if err != nil {
+				return err
+			}
+			defer store.Close()
+
+			conn, err := store.pool.Take(context.Background())
+			if err != nil {
+				return err
+			}
+			defer store.pool.Put(conn)
+
+			type row struct {
+				hash string
+				seq  int
+				vec  []byte
+			}
+			var rows []row
+			err = sqlitex.Execute(conn,
+				`SELECT hash, seq, vec FROM content_vectors WHERE LENGTH(vec) > ?`,
+				&sqlitex.ExecOptions{
+					Args: []any{dim * 4},
+					ResultFunc: func(stmt *sqlite.Stmt) error {
+						b := make([]byte, stmt.ColumnLen(2))
+						stmt.ColumnBytes(2, b)
+						rows = append(rows, row{hash: stmt.ColumnText(0), seq: stmt.ColumnInt(1), vec: b})
+						return nil
+					},
+				})
+			if err != nil {
+				return err
+			}
+			if len(rows) == 0 {
+				fmt.Printf("no vectors above %d dims; nothing to migrate\n", dim)
+				return nil
+			}
+
+			if err := sqlitex.Execute(conn, "BEGIN", nil); err != nil {
+				return err
+			}
+			for _, r := range rows {
+				src := make([]float32, len(r.vec)/4)
+				for i := range src {
+					bits := uint32(r.vec[i*4]) | uint32(r.vec[i*4+1])<<8 |
+						uint32(r.vec[i*4+2])<<16 | uint32(r.vec[i*4+3])<<24
+					src[i] = math.Float32frombits(bits)
+				}
+				out := truncateMRL(src, dim)
+				if err := sqlitex.Execute(conn,
+					`UPDATE content_vectors SET vec = ?, fp = ? WHERE hash = ? AND seq = ?`,
+					&sqlitex.ExecOptions{Args: []any{float32ToBytes(out), fp, r.hash, r.seq}}); err != nil {
+					sqlitex.Execute(conn, "ROLLBACK", nil)
+					return err
+				}
+			}
+			// Re-stamp dummy placeholders too, so they don't read as stale.
+			if err := sqlitex.Execute(conn,
+				`UPDATE content_vectors SET fp = ? WHERE LENGTH(vec) = 4 AND fp <> ?`,
+				&sqlitex.ExecOptions{Args: []any{fp, fp}}); err != nil {
+				sqlitex.Execute(conn, "ROLLBACK", nil)
+				return err
+			}
+			if err := sqlitex.Execute(conn, "COMMIT", nil); err != nil {
+				return err
+			}
+			fmt.Printf("truncated %d vectors to %d dims (fingerprint %s)\n", len(rows), dim, fp)
+
+			fmt.Println("reclaiming space (VACUUM)...")
+			if err := sqlitex.Execute(conn, "VACUUM", nil); err != nil {
+				return fmt.Errorf("vacuum: %w", err)
+			}
+			// Flush the WAL so the main-file size below reflects the vacuum.
+			sqlitex.Execute(conn, "PRAGMA wal_checkpoint(TRUNCATE)", nil)
+			if st, err := os.Stat(dbp); err == nil && sizeBefore > 0 {
+				fmt.Printf("index: %.0f MB -> %.0f MB\n",
+					float64(sizeBefore)/1048576, float64(st.Size())/1048576)
+			}
 			return nil
 		},
 	}

@@ -19,10 +19,13 @@ vectors, weighted RRF fusion, EmbeddingGemma-300M-Q8 + Qwen3 reranker +
    expansion-generated long queries, not the missing offload. Both fixed:
    hybrid 96s → ~7s (6× faster than qmd), 14-term BM25 9s → 0.4s. Fast paths
    unchanged (BM25 70ms, vsearch 0.5s over ~24K vectors).
-1. **Matryoshka truncation 768→256** (~10 lines, no deps).
-   EmbeddingGemma is MRL-trained: `vec[:256]` + L2-renormalize. −2.4% MTEB,
-   exact 3× smaller disk/RAM and 3× faster brute-force scan (fewer BLOB bytes
-   AND fewer float ops). Bump chunkerVersion / fingerprint; store dim.
+1. ~~**Matryoshka truncation 768→256**~~ **DONE in v0.6.0.**
+   Truncate+renormalize in `Embed()` (query and doc paths share it), dim in
+   the embedding fingerprint (`|d256`), `PICOQMD_EMBED_DIM` override, and
+   `migrate-vectors` for instant in-place conversion of existing indexes
+   (MRL property: truncation == embedding at the lower dim). Measured:
+   index 853MB → 743MB, vsearch 0.5s → 0.3s, bench quality within noise
+   (hit@10 100% unchanged, MRR 1.0 → 0.9 on the 5-query fixture).
    This alone makes embedding the 6,400-book corpus tractable.
 2. **Flat file-hash incremental reindex.** Only re-chunk/re-embed changed
    files (path→content-hash already exists; extend to chunk-level so a

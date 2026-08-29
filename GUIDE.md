@@ -178,6 +178,18 @@ picoqmd cleanup --dry-run    # report what would be deleted
 picoqmd cleanup              # delete; then run `picoqmd sync` to re-embed
 ```
 
+### `migrate-vectors`: truncate stored vectors to the current dimension
+
+```
+picoqmd migrate-vectors
+```
+
+Converts an existing index's vectors to the current Matryoshka target
+dimension (default 256) in place, in seconds. For MRL-trained models this is
+exactly equivalent to re-embedding at the lower dimension. Runs a VACUUM and
+reports the index size change. Use after upgrading from a pre-v0.6.0 index,
+or after changing `PICOQMD_EMBED_DIM` to a smaller value.
+
 ### `bench`: measure search quality
 
 ```
@@ -287,6 +299,7 @@ Override with `XDG_CONFIG_HOME` and `XDG_CACHE_HOME`.
 
 | Variable | Purpose |
 |---|---|
+| `PICOQMD_EMBED_DIM` | Matryoshka truncation dimension for embeddings (default 256; 0 = full model dimension) |
 | `PICOQMD_LIB` | Path to llama.cpp shared library (skips auto-download) |
 | `YZMA_LIB` | Fallback for llama.cpp library path |
 | `XDG_CONFIG_HOME` | Override config directory |
@@ -404,6 +417,7 @@ picoqmd update                             # alias for sync
 picoqmd status                             # collection/document/chunk counts
 picoqmd doctor                             # model identity + stale/orphan vector check
 picoqmd cleanup --dry-run                  # preview stale/orphan vector removal
+picoqmd migrate-vectors                    # truncate vectors to current dim in place
 picoqmd bench fixture.json                 # score search quality per pipeline
 
 # ── RETRIEVAL ──────────────────────────────────────────
