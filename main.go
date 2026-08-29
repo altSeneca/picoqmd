@@ -55,7 +55,7 @@ import (
 // ---------------------------------------------------------------------------
 
 const (
-	version       = "0.6.0"
+	version       = "0.6.1"
 	defaultDB     = "index.sqlite"
 	chunkTarget   = 900 // target tokens per chunk
 	chunkLookback = 200 // tokens to look back for break points
@@ -920,6 +920,51 @@ func (s *Store) searchVector(query string, queryVec []float32, collection string
 		results = append(results, r)
 	}
 	return results, nil
+}
+
+// RerankText returns document text for cross-encoder scoring: the region
+// around `line` (where the snippet matched; 12 lines of leading context) or
+// the file head when the line is unknown, capped at maxChars. Empty string
+// when the doc can't be resolved or read; callers fall back to the snippet.
+func (s *Store) RerankText(docID string, line, maxChars int) string {
+	conn, err := s.pool.Take(context.Background())
+	if err != nil {
+		return ""
+	}
+	var absPath string
+	err = sqlitex.Execute(conn, `
+		SELECT c.path || '/' || d.path FROM documents d
+		JOIN collections c ON c.id = d.col_id
+		WHERE d.docid = ? AND d.active = 1 LIMIT 1`,
+		&sqlitex.ExecOptions{
+			Args: []any{docID},
+			ResultFunc: func(stmt *sqlite.Stmt) error {
+				absPath = stmt.ColumnText(0)
+				return nil
+			},
+		})
+	s.pool.Put(conn)
+	if err != nil || absPath == "" {
+		return ""
+	}
+	data, err := os.ReadFile(absPath)
+	if err != nil {
+		return ""
+	}
+	lines := strings.Split(string(data), "\n")
+	start := 0
+	if line > 12 {
+		start = line - 12
+	}
+	var b strings.Builder
+	for i := start; i < len(lines); i++ {
+		if b.Len()+len(lines[i])+1 > maxChars {
+			break
+		}
+		b.WriteString(lines[i])
+		b.WriteByte('\n')
+	}
+	return strings.TrimSpace(b.String())
 }
 
 // GetDocument retrieves a single document by docid or path.

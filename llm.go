@@ -178,7 +178,9 @@ func (e *LLMEngine) ensureRerankModel() error {
 
 	ctxParams := llama.ContextDefaultParams()
 	ctxParams.NCtx = 4096
-	ctxParams.NBatch = 512
+	// One candidate = template + query + document text in a single batch;
+	// real chunk text (fed since v0.6.1) needs more than the old 512.
+	ctxParams.NBatch = 4096
 
 	ctx, err := llama.InitFromModel(model, ctxParams)
 	if err != nil {
@@ -474,15 +476,36 @@ func (e *LLMEngine) Rerank(query, intent string, candidates []string) ([]float64
 	vocab := llama.ModelGetVocab(e.rerankModel)
 	scores := make([]float64, len(candidates))
 
+	// Qwen3-Reranker is trained on this exact chat-format template; a bare
+	// "Query:/Document:/Relevant:" prompt is out of distribution and its
+	// yes/no logits come back poorly calibrated.
+	instruct := "Given a search query, retrieve relevant passages that answer the query"
+	if intent != "" {
+		instruct = intent
+	}
+	const rerankSystem = `Judge whether the Document meets the requirements based on the Query and the Instruct provided. Note that the answer can only be "yes" or "no".`
+
 	for i, candidate := range candidates {
-		var input string
-		if intent != "" {
-			input = fmt.Sprintf("Intent: %s\nQuery: %s\nDocument: %s\nRelevant:", intent, query, candidate)
-		} else {
-			input = fmt.Sprintf("Query: %s\nDocument: %s\nRelevant:", query, candidate)
+		input := "<|im_start|>system\n" + rerankSystem + "<|im_end|>\n" +
+			"<|im_start|>user\n<Instruct>: " + instruct +
+			"\n<Query>: " + query +
+			"\n<Document>: " + candidate + "<|im_end|>\n" +
+			"<|im_start|>assistant\n<think>\n\n</think>\n\n"
+
+		tokens := llama.Tokenize(vocab, input, true, true)
+		maxTokens := int(llama.NCtx(e.rerankCtx))
+		if len(tokens) > maxTokens {
+			tokens = tokens[:maxTokens]
 		}
 
-		tokens := llama.Tokenize(vocab, input, true, false)
+		// Clear the KV cache between candidates — without this, every
+		// candidate is scored on top of the previous candidates' context and
+		// the yes/no logits become order-dependent noise. (The embed path
+		// always did this; Rerank didn't.)
+		if mem, err := llama.GetMemory(e.rerankCtx); err == nil && mem != 0 {
+			llama.MemoryClear(mem, false)
+		}
+
 		batch := llama.BatchGetOne(tokens)
 
 		if _, err := llama.Decode(e.rerankCtx, batch); err != nil {
@@ -680,11 +703,17 @@ func (h *HybridSearcher) Search(ctx context.Context, query, intent, collection s
 		rrfRanked = rrfRanked[:maxRerank]
 	}
 
-	// LLM re-ranking
+	// LLM re-ranking. Judge the document region the match came from, not
+	// just title+snippet — vector-found docs often have thin or empty
+	// snippets, which starved the reranker of anything to score.
 	var candidateTexts []string
 	for _, entry := range rrfRanked {
 		doc := docByID[entry.docID]
-		candidateTexts = append(candidateTexts, doc.Title+" "+doc.Snippet)
+		text := h.store.RerankText(doc.DocID, doc.Line, 1500)
+		if text == "" {
+			text = doc.Snippet
+		}
+		candidateTexts = append(candidateTexts, doc.Title+"\n"+text)
 	}
 
 	var rerankScores []float64
@@ -707,10 +736,16 @@ func (h *HybridSearcher) Search(ctx context.Context, query, intent, collection s
 		return results, nil
 	}
 
-	// Position-aware blend
+	// Position-aware blend. RRF scores live around 0.02-0.10 while rerank
+	// probabilities span 0-1; without normalizing RRF to [0,1] the reranker
+	// dominated every position and the weights below were illusory.
+	maxRRF := rrfRanked[0].score
+	if maxRRF <= 0 {
+		maxRRF = 1
+	}
 	var results []SearchResult
 	for i, entry := range rrfRanked {
-		rrfNorm := entry.score
+		rrfNorm := entry.score / maxRRF
 		rerank := rerankScores[i]
 
 		var rrfWeight, rerankWeight float64

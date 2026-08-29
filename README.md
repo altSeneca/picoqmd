@@ -45,9 +45,11 @@ Most search tools assume fast hardware. PicoQMD is built for everything else:
 - **Degrades gracefully.** Without models, vector/hybrid tools are hidden from the agent; BM25, get, and observations still work
 - **Safe under launchd/cron/systemd.** Progress output auto-quiets when stdout is not a TTY, so captured logs stay bounded
 
-## What's New in v0.6.0
+## What's New in v0.6.x
 
-Matryoshka-256 vectors (full details in [CHANGELOG.md](CHANGELOG.md)):
+**v0.6.1: reranker fixed.** The v0.5.0 bench exposed the hybrid pipeline scoring worse than plain vector search; five compounding defects in the rerank stage (KV-cache contamination between candidates, an out-of-distribution prompt instead of Qwen3-Reranker's documented template, title-only candidate text, an RRF/rerank score-scale mismatch, and a too-small decode batch) are fixed. Measured: hybrid hit@10 60% → 100%, MRR 0.50 → 1.00 on the reference fixture, now the strongest pipeline.
+
+**v0.6.0: Matryoshka-256 vectors** (full details in [CHANGELOG.md](CHANGELOG.md)):
 
 - **Embeddings are truncated to 256 dims** (from EmbeddingGemma's 768) and L2-renormalized, at both document and query time. 3× smaller vector storage, 3× faster brute-force scans, ~97.6% of full-dimension quality. Measured on a 10,800-doc corpus: index 853MB → 743MB, vector search 0.5s → 0.3s, bench quality within noise of 768-dim (hit@10 unchanged at 100%, MRR 1.0 → 0.9 on a 5-query fixture).
 - **`picoqmd migrate-vectors`** converts an existing index in place in seconds. MRL training means truncate+renormalize produces exactly what embedding at 256 dims would; no re-embed needed. Includes a VACUUM to reclaim the space.

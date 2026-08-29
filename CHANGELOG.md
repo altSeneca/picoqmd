@@ -1,5 +1,39 @@
 # Changelog
 
+## [0.6.1] - 2026-08-29
+
+### Reranker fixed: hybrid is now the best pipeline
+
+The bench added in v0.5.0 exposed the hybrid pipeline scoring WORSE than
+plain vector search (hit@10 60% vs 100%, MRR 0.5 vs 0.9 on the reference
+fixture), and `--no-rerank` recovered the correct results, isolating the
+reranker stage. Five compounding defects, all fixed:
+
+- **KV-cache contamination.** `Rerank()` never cleared llama's memory
+  between candidates, so each candidate's yes/no logits were computed on
+  top of every previous candidate's context. Scores were order-dependent
+  noise. Now cleared per candidate, as the embed path always did.
+- **Out-of-distribution prompt.** Qwen3-Reranker is trained on a strict
+  chat-format template (system rule + `<Instruct>/<Query>/<Document>` +
+  empty think block); we sent a bare `Query:/Document:/Relevant:` prompt.
+  Now uses the model's documented template, with `intent` mapped to
+  `<Instruct>`.
+- **Input starvation.** Candidates were scored on `title + snippet`, and
+  vector-found documents often had thin or empty snippets. New
+  `Store.RerankText` feeds the document region the match came from
+  (12 lines of leading context, 1500-char cap), falling back to the
+  snippet.
+- **Scale mismatch in the blend.** Raw RRF scores (~0.02-0.10) were mixed
+  with rerank probabilities (0-1), so the reranker dominated every rank and
+  the position-aware weights were illusory. RRF is now normalized to [0,1]
+  before blending.
+- **Batch overflow.** Rerank context NBatch was 512 tokens; real chunk text
+  plus the template would not fit in one decode. Raised to 4096 (= NCtx).
+
+Measured on the reference fixture (k=10): hybrid hit@k 60% → **100%**,
+MRR 0.50 → **1.00**, recall 0.60 → **1.00** — now the strongest pipeline,
+ahead of plain vector (MRR 0.90).
+
 ## [0.6.0] - 2026-08-29
 
 ### Matryoshka-256 vectors (ROADMAP phase 1, item 1)
