@@ -32,7 +32,7 @@ sudo mv picoqmd /usr/local/bin/
 
 **Documents.** Individual files within a collection. Each gets a short content-hash ID (e.g., `#a3f2c1`) for quick reference.
 
-**Chunks.** Documents are split into ~900-token pieces at structural boundaries (headings, paragraphs) for embedding.
+**Chunks.** Documents are split into ~900-token pieces at structural boundaries (headings, paragraphs) for embedding. Code files (TypeScript/JavaScript, Python, Go, Rust) can instead be cut at function/class/import boundaries with `--chunk-strategy auto` (see `sync` below) — same idea as QMD's AST-aware chunking, but pure Go, no C toolchain.
 
 **Embeddings.** Vector representations of chunks, enabling semantic search. Generated locally using a 300MB GGUF model.
 
@@ -127,6 +127,8 @@ Detects changed files across all collections, re-indexes them, and generates emb
 
 `update` and `embed` are aliases for `sync`.
 
+**Code chunking.** By default everything chunks on markdown structure (`--chunk-strategy regex`). With `--chunk-strategy auto`, code files (`.ts/.tsx/.js/.jsx/.mts/.cts/.mjs/.cjs/.py/.go/.rs`) are parsed with a pure-Go tree-sitter port and cut at function/class/import boundaries instead of arbitrary line positions; markdown always uses structural chunking either way. The strategy is part of the embedding fingerprint (`cv1` vs `cv2`), so switching strategies marks documents pending for re-embed once — `status` shows the active strategy. Flag or env var (`PICOQMD_CHUNK_STRATEGY=auto`); the flag wins and is inherited by the embed worker.
+
 ### `search`: BM25 full-text search
 
 ```
@@ -196,7 +198,7 @@ or after changing `PICOQMD_EMBED_DIM` to a smaller value.
 picoqmd bench fixture.json [--pipeline bm25|vector|research|hybrid] [--misses]
 ```
 
-Scores each pipeline against a fixture of queries with known-good results (hit@k, precision, recall, MRR). See `example-bench.json` for the format. Useful before and after any change to models, chunking, or ranking.
+Scores each pipeline against a fixture of queries with known-good results (hit@k, precision, recall, MRR). See `example-bench.json` for the format, and `example-bench-code.json` for a self-contained code-search fixture (index this repo's `**/*.go`, then `picoqmd bench example-bench-code.json`). Useful before and after any change to models, chunking, or ranking.
 
 ### `model`: manage models
 
@@ -300,6 +302,7 @@ Override with `XDG_CONFIG_HOME` and `XDG_CACHE_HOME`.
 | Variable | Purpose |
 |---|---|
 | `PICOQMD_EMBED_DIM` | Matryoshka truncation dimension for embeddings (default 256; 0 = full model dimension) |
+| `PICOQMD_CHUNK_STRATEGY` | Code chunking: `regex` (default) or `auto` (AST boundaries for ts/js/py/go/rust). Same as `--chunk-strategy`; the flag wins. |
 | `PICOQMD_LIB` | Path to llama.cpp shared library (skips auto-download) |
 | `YZMA_LIB` | Fallback for llama.cpp library path |
 | `XDG_CONFIG_HOME` | Override config directory |

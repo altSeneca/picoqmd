@@ -1,5 +1,32 @@
 # Changelog
 
+## [Unreleased]
+
+### AST-aware code chunking (ROADMAP phase 3, item 6)
+
+- **`--chunk-strategy auto`** (or `PICOQMD_CHUNK_STRATEGY=auto`) cuts code
+  files at function/class/import boundaries instead of arbitrary line
+  positions, using a pure-Go tree-sitter port
+  (`dcosson/treesitter-go` — no cgo, static binary and one-line
+  cross-compiles preserved). Same per-language queries and break-point
+  scores as QMD's `--chunk-strategy auto`. Supported: TypeScript/TSX,
+  JavaScript, Python, Go, Rust; markdown always uses structural chunking.
+- **Default `regex` output is byte-identical** — existing indexes never
+  re-embed on upgrade. The strategy is folded into the embedding
+  fingerprint (`cv1` vs `cv2`), so opting into `auto` marks documents
+  pending for re-embed exactly once. `status` (CLI + MCP) reports the
+  active strategy.
+- Measured on a 60-function Go fixture: functions split across chunk
+  boundaries 21 → 6 at equal chunk counts.
+- Retrieval quality holds up cross-engine on shared corpora (qmd/src +
+  mdBook guide, same models). pico auto vs regex, MRR — code fixture:
+  bm25 0.625 vs 0.542, vector 0.917 vs 0.792, research 1.000 vs 0.867,
+  hybrid 0.917 vs 0.867; markdown fixture: vector 1.000, research 0.889,
+  hybrid 1.000 both (markdown chunks are identical by design). QMD
+  itself scores in the same band on equivalent fixtures (code hybrid
+  MRR 1.000, markdown vector MRR 0.625) — small fixtures saturate, but
+  nothing regressed and auto leads everywhere it can move.
+
 ## [0.6.2] - 2026-08-29
 
 ### Rerank-on-ambiguity

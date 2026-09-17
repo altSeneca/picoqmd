@@ -2056,6 +2056,7 @@ func (m *MCPServer) callTool(params json.RawMessage) (any, error) {
 			"needsEmbedding":    pending,
 			"hasVectorIndex":    pending == 0 && chunks > 0,
 			"fingerprint":       embedFingerprint(),
+			"chunkStrategy":     activeChunkStrategy(),
 			"staleObservations": len(stale),
 		}), nil
 
@@ -2415,13 +2416,14 @@ var (
 func embedFingerprint() string {
 	embedFPOnce.Do(func() {
 		name := defaultModels[0].Filename
+		cv := chunkerVersionFor(activeChunkStrategy())
 		if h := modelFileHash(filepath.Join(cacheDir(), "models", name)); h != "" {
-			embedFPCached = name + "@" + h + "|" + chunkerVersion
+			embedFPCached = name + "@" + h + "|" + cv
 		} else {
 			// Model not downloaded (BM25-only install): legacy name-only
 			// form. Embedding requires the model, so no vector is ever
 			// written under this fallback.
-			embedFPCached = name + "|" + chunkerVersion
+			embedFPCached = name + "|" + cv
 		}
 		if dim := embedTargetDim(); dim > 0 {
 			embedFPCached += fmt.Sprintf("|d%d", dim)
@@ -2938,6 +2940,7 @@ func main() {
 	var noExpand bool
 	var noRerank bool
 	var searchIntent string
+	var chunkStrategyFlag string
 
 	// --- smartSearch dispatches to the best available pipeline ---
 	smartSearch := func(query, intent string, store *Store, engine Embedder, limit int, format string) error {
@@ -3026,11 +3029,22 @@ Quick start:
 	root.PersistentFlags().BoolVar(&noExpand, "no-expand", false, "skip the LLM query-expansion stage (forces strong-signal-only behavior)")
 	root.PersistentFlags().BoolVar(&noRerank, "no-rerank", false, "skip the LLM reranking stage (RRF-fused order, faster on constrained hardware)")
 	root.PersistentFlags().StringVar(&searchIntent, "intent", "", "optional disambiguation hint passed to expansion, reranking, and snippet selection")
+	root.PersistentFlags().StringVar(&chunkStrategyFlag, "chunk-strategy", "", "code chunking: regex (default) or auto (AST boundaries for ts/js/py/go/rust; also via PICOQMD_CHUNK_STRATEGY)")
 	// --verbose overrides the auto-quiet behavior. We can't share a single
 	// bool with --quiet (cobra rejects that), so we fix it up after parse:
 	root.PersistentPreRunE = func(cmd *cobra.Command, args []string) error {
 		if v, _ := cmd.Flags().GetBool("verbose"); v {
 			quiet = false
+		}
+		// A --chunk-strategy flag wins over the environment and is exported
+		// so the embed-worker subprocess (which inherits os.Environ)
+		// chunks with the same strategy the user asked for.
+		if chunkStrategyFlag != "" {
+			strategy, err := parseChunkStrategy(chunkStrategyFlag)
+			if err != nil {
+				return err
+			}
+			os.Setenv("PICOQMD_CHUNK_STRATEGY", strategy)
 		}
 		return nil
 	}
@@ -3349,10 +3363,10 @@ Quick start:
 			}
 			defer store.Close()
 
-			cols, docs, chunks, _ := store.Stats()
-			pending, _ := store.CountUnembedded(embedFingerprint(), "")
-			fmt.Printf("collections: %d\ndocuments:   %d\nchunks:      %d\npending:     %d docs need (re-)embedding\nfingerprint: %s\ndatabase:    %s\n",
-				cols, docs, chunks, pending, embedFingerprint(), dbPath(indexName))
+		cols, docs, chunks, _ := store.Stats()
+		pending, _ := store.CountUnembedded(embedFingerprint(), "")
+		fmt.Printf("collections: %d\ndocuments:   %d\nchunks:      %d\npending:     %d docs need (re-)embedding\nfingerprint: %s\nchunk-strategy: %s\ndatabase:    %s\n",
+			cols, docs, chunks, pending, embedFingerprint(), activeChunkStrategy(), dbPath(indexName))
 			return nil
 		},
 	}

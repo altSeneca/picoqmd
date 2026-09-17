@@ -49,10 +49,14 @@ vectors, weighted RRF fusion, EmbeddingGemma-300M-Q8 + Qwen3 reranker +
    but its binary-quant recipe ports cleanly.
 
 ### Phase 3 — code intelligence (differentiators)
-6. **Tree-sitter AST chunking** (`smacker/go-tree-sitter`, cgo at compile
-   time only). Chunk at function/class boundaries, fall back line-based;
-   Roo Code's exact strategy. Fixes the 900-token splitter cutting
-   functions mid-body in shared-src/android-src/ios-src.
+6. **Tree-sitter AST chunking** — implemented with `dcosson/treesitter-go`
+    (pure Go, no cgo — the roadmap's `smacker/go-tree-sitter` would have
+    cost the static binary and one-line cross-compiles). Chunk at
+    function/class boundaries via the same per-language queries and
+    score map QMD uses, fall back line-based; fixes the 900-token
+    splitter cutting functions mid-body in shared-src/android-src/ios-src.
+    Opt-in via `--chunk-strategy auto` (default `regex` keeps legacy
+    output byte-identical); strategy is fingerprinted (`cv1`/`cv2`).
 7. **Aider-style personalized-PageRank repo map.** File graph from
    tree-sitter def/ref tags, PageRank seeded by query-mentioned
    identifiers, token-budgeted output. ~50-line power iteration; expose as

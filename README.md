@@ -25,7 +25,7 @@ If you're looking for "QMD but for a lower-spec computer", this is the trade-off
 | Embedding fingerprints (stale-vector detection) | yes | yes; v0.5.0 hashes the model file's bytes, so a swapped model re-embeds instead of silently serving mismatched vectors |
 | Search-quality benchmarking | `qmd bench` | `picoqmd bench` (v0.5.0) |
 | Index diagnostics | `qmd doctor` | `picoqmd doctor` + `cleanup` (v0.5.0) |
-| AST/tree-sitter code chunking | yes | not yet ([roadmap](ROADMAP.md)) |
+| AST/tree-sitter code chunking | yes | yes (`--chunk-strategy auto`, pure-Go, no cgo) |
 | CJK trigram search | yes | no (left out on purpose; it doubles the index) |
 
 PicoQMD is not a fork. It's an independent Go implementation that tracks QMD's retrieval design and ports the fixes that apply (v0.4.0 covered QMD v2.1 to v2.6.3; v0.5.0 covers the v2.8.x round). If you have a fast dev machine and live in the Node ecosystem, use QMD. If you want the same local search quality in a fraction of the footprint, or on hardware QMD can't run at all, use PicoQMD.
@@ -274,7 +274,7 @@ PicoQMD automatically skips binary files, files over 1MB, and common noise direc
 
 ## Roadmap
 
-See [ROADMAP.md](ROADMAP.md). Matryoshka 768→256 truncation shipped in v0.6.0. Next up: chunk-level incremental re-embedding, recency-aware ranking, binary quantization with two-phase rescoring for very large corpora, and tree-sitter AST chunking for code.
+See [ROADMAP.md](ROADMAP.md). Matryoshka 768→256 truncation shipped in v0.6.0, AST code chunking (`--chunk-strategy auto`) is available for TypeScript/JavaScript, Python, Go, and Rust. Next up: chunk-level incremental re-embedding, recency-aware ranking, and binary quantization with two-phase rescoring for very large corpora.
 
 ## Acknowledgments
 
